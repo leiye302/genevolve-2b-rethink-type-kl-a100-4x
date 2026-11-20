@@ -1,0 +1,20 @@
+{
+  "tag": "route-sft-reviewed-v3-public",
+  "name": "genevolve-route-sft-reviewed-v3-public.zip",
+  "bytes": 39387019,
+  "sha256": "a55dafb66831b4c75cde36b07f2d0bd178f7775f53b40a14a37ac289309f3bd3",
+  "files": {
+    "manifest.json": {
+      "bytes": 3186,
+      "sha256": "f86a97b40bf7264ba92f5188d2e7dc0b4c7e3f2ec7a8560fa84a89042aedfdff"
+    },
+    "batches.jsonl": {
+      "bytes": 105671,
+      "sha256": "10dc620f637ca6f883e24ecdd28eb1f07b0f06fb08cee17d119a96085b53a76f"
+    },
+    "train.jsonl": {
+      "bytes": 172532619,
+      "sha256": "c4ce12f635e685f9f44bdd3581ebba017ecb1060adc25d3f2f6ca5c0e72f62d1"
+    }
+  }
+}

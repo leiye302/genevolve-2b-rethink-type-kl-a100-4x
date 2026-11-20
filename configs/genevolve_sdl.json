@@ -1,0 +1,8 @@
+{
+  "sdl_coef": 2.0,
+  "sdl_ratio_cap": 2.0,
+  "sdl_token_cap": 10.0,
+  "sdl_top_fraction": 0.1,
+  "min_reward_gap": 0.20,
+  "experience_capacity": 500
+}
