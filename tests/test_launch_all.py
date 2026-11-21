@@ -16,8 +16,8 @@ class LaunchAllTest(unittest.TestCase):
         root = Path(directory).resolve()
         self.work = root / "work"
         self.parent = root / "checkpoint-550"
-        self.pack = root / "route-sft-v3"
-        self.final = self.work / "route_sft" / "hf-step-00297"
+        self.pack = root / "route-sft-v4"
+        self.final = self.work / "route_sft" / "hf-step-00562"
         self.args = Namespace(command="all", parent=self.parent, data=self.pack, steps=30, eval=False)
         stack = self.enterContext(ExitStack())
         stack.enter_context(redirect_stdout(StringIO()))
@@ -59,7 +59,7 @@ class LaunchAllTest(unittest.TestCase):
         ])
         self.assertEqual(self.sequence.launch.call_args_list[-1],
                          call("_eval", self.work, "--split", "bench", "--policy",
-                              str(self.work / "rethink" / "final")))
+                              str(self.work / "rethink" / "final"), "--max-cases", "8"))
 
     def test_resume_reuses_ready_stage1_and_pinned_data(self):
         self.final.mkdir(parents=True)
@@ -100,6 +100,29 @@ class LaunchAllTest(unittest.TestCase):
         self.sequence.launch.assert_called_once()
         self.sequence.handoff.assert_not_called()
         self.sequence.prepare_embedding.assert_not_called()
+
+    def test_route_only_eval_is_called_once_after_final_verified_and_not_at_281(self):
+        args = Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=True)
+        run.execute(args, self.work)
+        self.assertEqual(self.sequence.launch.call_args_list, [
+            call("_route-sft", self.work, "--parent", str(self.parent), "--data", str(self.pack)),
+            call("_eval", self.work, "--split", "bench", "--policy", str(self.final), "--max-cases", "8"),
+        ])
+        self.sequence.handoff.assert_called_once_with(self.final)
+        self.sequence.services.assert_not_called()
+
+    def test_route_only_plain_command_never_evaluates_or_needs_services(self):
+        run.execute(Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=False), self.work)
+        self.sequence.launch.assert_called_once_with("_route-sft", self.work, "--parent", str(self.parent),
+                                                   "--data", str(self.pack))
+        self.sequence.env.assert_not_called()
+        self.sequence.prepare.assert_not_called()
+
+    def test_failed_final_handoff_never_pays_for_evaluation(self):
+        self.sequence.handoff.side_effect = ValueError("invalid export")
+        with self.assertRaisesRegex(ValueError, "invalid export"):
+            run.execute(Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=True), self.work)
+        self.assertEqual([x.args[0] for x in self.sequence.launch.call_args_list], ["_route-sft"])
 
     def test_bad_route_export_blocks_stage2(self):
         self.sequence.handoff.side_effect = ValueError("fixture export mismatch")

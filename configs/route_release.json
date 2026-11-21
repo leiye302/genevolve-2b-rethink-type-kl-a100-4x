@@ -1,20 +1,20 @@
 {
-  "tag": "route-sft-reviewed-v3-public",
-  "name": "genevolve-route-sft-reviewed-v3-public.zip",
-  "bytes": 39387019,
-  "sha256": "a55dafb66831b4c75cde36b07f2d0bd178f7775f53b40a14a37ac289309f3bd3",
+  "tag": "route-sft-reviewed-v4-public",
+  "name": "genevolve-route-sft-reviewed-v4-public.zip",
+  "bytes": 37204161,
+  "sha256": "5fe9f870ee6e652d8281549223741d7c5e9a481ad19bdae30029f0a95361ac26",
   "files": {
     "manifest.json": {
-      "bytes": 3186,
-      "sha256": "f86a97b40bf7264ba92f5188d2e7dc0b4c7e3f2ec7a8560fa84a89042aedfdff"
-    },
-    "batches.jsonl": {
-      "bytes": 105671,
-      "sha256": "10dc620f637ca6f883e24ecdd28eb1f07b0f06fb08cee17d119a96085b53a76f"
+      "bytes": 3144,
+      "sha256": "3499f4cb651c0cecafd70d51d892622a02cd17570d26de8b5c8473e90fd351bf"
     },
     "train.jsonl": {
-      "bytes": 172532619,
-      "sha256": "c4ce12f635e685f9f44bdd3581ebba017ecb1060adc25d3f2f6ca5c0e72f62d1"
+      "bytes": 162871839,
+      "sha256": "2087d057bb1ff3cf84277e1689e137134ec8f3e91505d617c93540548f5f3132"
+    },
+    "batches.jsonl": {
+      "bytes": 99894,
+      "sha256": "80d165ff770e87cdf39045194d84bb432468159652a2e4a91929c6dd20ca00a4"
     }
   }
 }

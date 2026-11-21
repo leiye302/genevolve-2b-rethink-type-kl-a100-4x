@@ -1,0 +1,10 @@
+{
+  "split": "bench",
+  "full_count": 594,
+  "max_cases": 8,
+  "selected_case_ids": ["0", "1", "2", "3", "4", "5", "6", "7"],
+  "selection": "first_n_pinned_order",
+  "seed": 42,
+  "temperature": 0.6,
+  "top_p": 0.9
+}

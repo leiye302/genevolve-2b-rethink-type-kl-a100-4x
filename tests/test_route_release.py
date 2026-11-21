@@ -108,6 +108,19 @@ class ReleaseTest(unittest.TestCase):
         self.assertFalse((self.work / "route_data" / spec["tag"]).exists())
         self.assertEqual(urlopen.call_count, 1)
 
+    def test_private_historical_data_cannot_be_replaced_by_v3_or_modified_data(self):
+        cfg = route_data.recipe()
+        locked = route_data.read_json(route_data.ROOT / "configs" / "route_original_v4.json")
+        original = {key + ".jsonl": locked[key + "_sha256"] for key in ("train", "batches")}
+        self.assertEqual((cfg["epochs"], cfg["batches_per_epoch"]), (2, 281))
+        route_data.verify_artifact_identity(cfg["manifest_sha256"], original, cfg)
+        changed = dict(original, **{"train.jsonl": "0" * 64})
+        with self.assertRaisesRegex(ValueError, "pinned SHA-256"):
+            route_data.verify_artifact_identity(cfg["manifest_sha256"], changed, cfg)
+        with self.assertRaisesRegex(ValueError, "manifest SHA-256"):
+            route_data.verify_artifact_identity(
+                "f86a97b40bf7264ba92f5188d2e7dc0b4c7e3f2ec7a8560fa84a89042aedfdff", original, cfg)
+
     def test_public_pack_identity_differs_from_original_and_is_pinned(self):
         cfg = route_data.recipe()
         m = {"schema": cfg["schema"], "batches": cfg["batches_per_epoch"],
@@ -117,8 +130,8 @@ class ReleaseTest(unittest.TestCase):
              "eos_id": route_data.EOS_ID, "ordered_batches": True, "retokenized_input_history": True,
              "history_truncation": False, "official_split_overlap_exact_normalized": 0,
              "checkpoint550_file_sha256": route_data.source_checkpoint_lock(),
-             "release_variant": "reviewed-v3-public", "original_manifest_sha256": cfg["manifest_sha256"],
-             "supervision_identical_to_reviewed_v3": True,
+             "release_variant": "reviewed-v4-public", "original_manifest_sha256": cfg["manifest_sha256"],
+             "supervision_identical_to_reviewed_v4": True,
              "artifact_sha256": {n: entry(self.blobs[n])["sha256"] for n in ("train.jsonl", "batches.jsonl")}}
         self.blobs["manifest.json"] = json.dumps(m).encode()
         spec, _ = self.mock_asset()

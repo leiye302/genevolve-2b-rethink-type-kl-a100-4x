@@ -1,130 +1,161 @@
-"""Good-only conditional Tool/Answer KL; no change to tokens or action protocol."""
-
+"""Native Tool / Answer / Other probabilities for the Good-only SFT-550 forward KL."""
+import hashlib
 import gc
+import json
 import math
-
+import os
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 import torch
 from torch.nn import functional as F
 
-from .common import read_json, write_json
-from .sft_export import file_sha256
-
-# These are native tokenizer IDs, NOT new special tokens. Answer is a
-# two-token distinguishing prefix. Its next '>' can merge with whitespace/JSON.
-TYPE_IDS = (151657, 27, 9217)  # <tool_call>, <, answer
-VERSION = "parent550-good-tool-answer-prefix-forward-kl-v1"
-
-
-def validate_config(cfg):
-    weight = cfg.get("good_type_kl_lambda", 0.0)
-    if not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
-        raise ValueError("good_type_kl_lambda must be finite and nonnegative.")
-    if weight and cfg.get("good_type_kl_version") != VERSION:
-        raise ValueError("Unknown Good type-KL objective version.")
-    return weight
+TYPE_IDS = (151657, 27, 9217)
+THREEWAY_VERSION = "parent550-good-forward-kl-full-tool-answer-other-mass-v1"
+def verify_type_ids(tokenizer):
+    if (tokenizer.encode("<tool_call>", add_special_tokens=False) != [TYPE_IDS[0]] or
+            tokenizer.encode("<answer", add_special_tokens=False) != list(TYPE_IDS[1:])):
+        raise ValueError("Native tokenizer does not have the expected action openers.")
 
 
-def verify_type_tokenizer(tokenizer):
-    if (tokenizer.encode("<tool_call>", add_special_tokens=False) != [TYPE_IDS[0]]
-            or tokenizer.encode("<answer", add_special_tokens=False) != list(TYPE_IDS[1:])):
-        raise ValueError("Native Tool/Answer distinguishing token prefixes changed.")
+def make_candidate_prefix(input_ids, start, type_ids=TYPE_IDS):
+    """H/R followed only by hypothetical '<'; works with prefix-only parent input."""
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or not 0 < start <= input_ids.shape[1]:
+        raise ValueError("Expected one sequence and a valid boundary.")
+    return torch.cat((input_ids[:, :start], input_ids.new_tensor([[type_ids[1]]])), 1)
 
 
-def type_log_probs(first_logits, after_open_logits, type_ids=TYPE_IDS):
-    """Conditional normalized p(tool|s), p('<answer'|s), in log space.
+def _lse_except(z, skip):
+    # The raw complement '1-exp(log_t)-exp(log_a)' is unreliable if O is tiny.
+    ids = sorted(skip)
+    pieces = [z[lo:hi] for lo,hi in zip([0] + [s+1 for s in ids], ids+[len(z)]) if hi > lo]
+    if not pieces:
+        raise ValueError("No remaining vocabulary items.")
+    return torch.logsumexp(torch.cat(pieces), 0)
 
-    The first-step full-vocabulary denominator cancels. This intentionally
-    is NOT the route BCE's full-vocabulary probability, nor p('<'|s) alone.
+
+def threeway_log_probs(first_logits, after_open_logits, type_ids=TYPE_IDS):
+    """Exact log probabilities of disjoint cylinder events under the full vocabulary.
+
+    log O combines first-token-other and '<' followed by something else. O also
+    includes participating vocabulary such as EOS and RETHINK; do not discard it.
+    T/A are opener events, not probabilities of an entire valid JSON program.
     """
-    tool, opening, answer = type_ids
-    first_logits, after_open_logits = first_logits.float(), after_open_logits.float()
-    scores = torch.stack((first_logits[tool], first_logits[opening]
-                          + F.log_softmax(after_open_logits, dim=-1)[answer]))
-    return F.log_softmax(scores, dim=0)
+    if (first_logits.ndim != 1 or after_open_logits.shape != first_logits.shape or
+            len(set(type_ids)) != 3 or min(type_ids) < 0 or max(type_ids) >= first_logits.numel()):
+        raise ValueError("Vocabulary/shape mismatch.")
+    t, opening, answer = type_ids
+    first, after = first_logits.float(), after_open_logits.float()
+    ft, fo, fr = first[t], first[opening], _lse_except(first, (t, opening))
+    a, r = after[answer], _lse_except(after, (answer,))
+    # Renormalize after subtracting the maximum, for stability even if a branch
+    # dominates and the other two carry tiny but nonzero mass.
+    second = F.log_softmax(torch.stack((a, r)), 0)
+    scores = torch.stack((ft, fo + second[0], torch.logaddexp(fr, fo + second[1])))
+    return F.log_softmax(scores, 0)
 
 
-def reference_to_student_kl(student_logp, reference_logp):
-    # Direction is forward KL(reference || student). No reference gradients.
+def score_threeway(model, input_ids, start, type_ids=TYPE_IDS):
+    """Parent under no_grad or differentiable student; no label/action/future read."""
+    ids = make_candidate_prefix(input_ids, start, type_ids)
+    hidden = model.model(input_ids=ids, use_cache=False, return_dict=True).last_hidden_state
+    first, after_open = model.lm_head(hidden[0,-2:]).unbind(0)
+    return threeway_log_probs(first, after_open, type_ids)
+
+
+def good_threeway_kl(student_logp, reference_logp):
+    """Per-Good-row forward KL. Caller must omit this operation on every Bad."""
+    if student_logp.shape != (3,) or reference_logp.shape != (3,):
+        raise ValueError("Expected three log probabilities; old 2-class caches are incompatible.")
     return F.kl_div(student_logp.float(), reference_logp.detach().float(),
                     reduction="sum", log_target=True)
 
+def _read(p):
+    return json.loads(p.read_bytes())
 
-def candidate_prefix(input_ids, start, type_ids=TYPE_IDS):
-    # H/R exactly as supplied to CE, ending BEFORE its first target. Append
-    # only the candidate '<'. No ground-truth action or future observation.
-    return torch.cat((input_ids[:, :start], input_ids.new_tensor([[type_ids[1]]])), dim=1)
+
+def _write(p, value):
+    with NamedTemporaryFile(mode="w", encoding="utf-8", dir=p.parent, delete=False) as f:
+        tmp = Path(f.name)
+        try:
+            json.dump(value, f, ensure_ascii=False, separators=(",",":"), allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        except BaseException:
+            f.close()
+            tmp.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(tmp, p)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _file_sha(p):
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _validate(entries, rows, wanted, complete=False):
+    if not isinstance(entries, dict) or not set(entries).issubset(wanted) or (complete and set(entries)!=set(wanted)):
+        raise ValueError("Unexpected or missing Good reference cache entries.")
+    for k,v in entries.items():
+        if not isinstance(v,dict) or v.get("id")!=rows[int(k)]["id"]:
+            raise ValueError("Reference row identity mismatch.")
+        lp=v.get("logp")
+        if (not isinstance(lp,list) or len(lp)!=3 or
+                not all(isinstance(x,(float,int)) and math.isfinite(x) and x<=1e-6 for x in lp) or
+                abs(sum(math.exp(x) for x in lp)-1.)>2e-5):
+            raise ValueError("Invalid three-way reference log probabilities.")
 
 
 @torch.no_grad()
-def score_reference(model, input_ids, start, type_ids=TYPE_IDS):
-    ids = candidate_prefix(input_ids, start, type_ids)
-    hidden = model.model(input_ids=ids, use_cache=False, return_dict=True).last_hidden_state
-    first, after_open = model.lm_head(hidden[0, -2:]).unbind(0)
-    return type_log_probs(first, after_open, type_ids)
-
-
-def validate_entries(entries, rows, expected, *, complete):
-    if not isinstance(entries, dict) or not set(entries) <= {str(k) for k in expected}:
-        raise ValueError("Unexpected reference cache row coverage.")
-    if complete and set(entries) != {str(k) for k in expected}:
-        raise ValueError("Incomplete reference cache row coverage.")
-    for key, item in entries.items():
-        logp = torch.tensor(item["logp"], dtype=torch.float64)
-        if (item["id"] != rows[int(key)]["id"] or logp.shape != (2,)
-                or not torch.isfinite(logp).all() or abs(float(logp.logsumexp(0))) > 2e-5):
-            raise ValueError("Invalid reference cache probabilities or sample identity.")
-
-
-def prepare_reference_cache(out, parent, rows, contract, rank, size, device, *, loader=None):
-    """Score frozen parent once, before loading the training actor.
-
-    Each rank processes a disjoint Good shard. Atomic progress files allow
-    restart; sealed shards are checked by SHA-256. Only 2 floats/Good are kept.
-    No GPU reference remains resident during SFT.
-    """
-    from .distributed import gather, load_model
-
-    cache_identity = {"version": VERSION, "contract": contract, "shards": size,
-                      "reference_dtype": "bfloat16", "reference_attention": "flash_attention_2",
-                      "type_ids": list(TYPE_IDS)}
-    folder = out / "good_type_reference"
-    folder.mkdir(parents=True, exist_ok=True)
-    path, receipt = folder / f"rank-{rank}.json", folder / f"rank-{rank}.sha256.json"
-    expected = [k for k, row in enumerate(rows) if row["route_label"] == 0 and k % size == rank]
-    saved = read_json(path) if path.is_file() else {"identity": cache_identity, "entries": {}}
-    if saved["identity"] != cache_identity:
-        raise ValueError("Good type reference belongs to another parent/data/config; use a new WORK.")
-    entries = saved["entries"]
-    sealed = receipt.is_file()
-    if sealed and read_json(receipt) != {path.name: file_sha256(path)}:
-        raise ValueError("Good type reference SHA-256 mismatch.")
-    validate_entries(entries, rows, expected, complete=sealed)
-    missing = [k for k in expected if str(k) not in entries]
+def prepare_reference_cache(out,parent,rows,contract,rank,size,device,*,loader=None,
+                            attention="flash_attention_2",flush_every=16,type_ids=TYPE_IDS):
+    """Score frozen parent once, unload before training. Returns only 3 floats/Good."""
+    if rank!=0 or size!=1 or flush_every<1:
+        raise ValueError("The verified SFT cache is single-rank and requires positive flush_every.")
+    if not contract or not isinstance(contract,dict):
+        raise ValueError("Missing bound parent/data/config contract.")
+    device=torch.device(device)
+    config={"version":THREEWAY_VERSION, "contract":contract, "dtype":"bfloat16",
+            "attention":attention,"type_ids":list(type_ids),"projection":"full-native-vocabulary"}
+    folder=Path(out)/"good_threeway_reference"
+    folder.mkdir(parents=True,exist_ok=True)
+    f=folder/"rank-0.json"
+    receipt=folder/"rank-0.sha256.json"
+    expected={str(j) for j,r in enumerate(rows) if r["route_label"]==0}
+    saved=_read(f) if f.is_file() else {"identity":config,"entries":{}}
+    if saved.get("identity")!=config:
+        raise ValueError("Three-way cache is for a different model/data/config.")
+    entries=saved["entries"]
+    sealed=receipt.is_file()
+    if sealed and (not f.is_file() or _read(receipt)!={f.name:_file_sha(f)}):
+        raise ValueError("Reference cache seal hash mismatch.")
+    _validate(entries,rows,expected,complete=sealed)
+    missing=sorted((int(k) for k in expected-set(entries)))
     if missing:
-        print(f"rank {rank}: caching frozen parent Tool/Answer probabilities for {len(missing)} Good rows", flush=True)
-        model = (loader or load_model)(parent, torch.bfloat16).to(device).eval().requires_grad_(False)
-        for count, k in enumerate(missing, 1):
-            row = rows[k]
-            ids = torch.tensor([row["input_ids"][:row["target_start"]]], device=device, dtype=torch.long)
-            logp = score_reference(model, ids, row["target_start"])
-            entries[str(k)] = {"id": row["id"], "logp": logp.cpu().tolist()}
-            if count % 25 == 0 or count == len(missing):
-                validate_entries(entries, rows, expected, complete=False)
-                write_json(path, saved)
-                print(f"rank {rank}: reference {len(entries)}/{len(expected)}", flush=True)
-        del model
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-    if not path.is_file():
-        write_json(path, saved)
-    validate_entries(entries, rows, expected, complete=True)
-    write_json(receipt, {path.name: file_sha256(path)})
-    shards = gather(entries)
-    combined = {}
-    for shard in shards:
-        if combined.keys() & shard.keys():
-            raise ValueError("Duplicate Good reference across ranks.")
-        combined.update(shard)
-    validate_entries(combined, rows, [k for k, row in enumerate(rows) if row["route_label"] == 0], complete=True)
-    return {int(k): item["logp"] for k, item in combined.items()}
+        if loader is None:
+            from .distributed import load_model as loader
+        model=loader(parent,torch.bfloat16,attention=attention).to(device).eval().requires_grad_(False)
+        try:
+            for pos,k in enumerate(missing,1):
+                r=rows[k]
+                start=r["target_start"]
+                # Do not even send future tokens or the true Good action to the parent.
+                ids=torch.tensor([r["input_ids"][:start]],device=device,dtype=torch.long)
+                lp=score_threeway(model,ids,start,type_ids).detach().cpu().tolist()
+                entries[str(k)]={"id":r["id"],"logp":lp}
+                if pos%flush_every==0 or pos==len(missing):
+                    _validate(entries,rows,expected)
+                    _write(f,saved)
+                    print(f"frozen SFT-550 Good reference: {len(entries)}/{len(expected)}", flush=True)
+        finally:
+            del model
+            gc.collect()
+            if device.type=="cuda":
+                torch.cuda.empty_cache()
+    _validate(entries,rows,expected,complete=True)
+    if not f.is_file():
+        _write(f,saved)
+    if not sealed:
+        _write(receipt,{f.name:_file_sha(f)})
+    return {int(k):v["logp"] for k,v in entries.items()}

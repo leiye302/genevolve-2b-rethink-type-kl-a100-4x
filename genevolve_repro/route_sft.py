@@ -1,30 +1,23 @@
-"""Four-rank Qwen3-VL-2B Route-SFT on the reviewed v3 examples."""
-
+"""One-rank GenEvolve Route-SFT. Original objective plus Good-only full-mass type KL."""
 from contextlib import nullcontext
+import gc
 import random
+import shutil
 from statistics import fmean
 
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
-
-from .common import model_ready, read_json, write_json
-from .distributed import (
-    barrier, export_policy, gather, initialize, latest, load_checkpoint, load_model,
-    make_sharded_actor, restore_optimizer, restore_rng, save_checkpoint,
-)
+from .common import read_json,write_json
+from .distributed import (initialize,latest,load_checkpoint,make_sharded_actor,load_model,
+                          save_checkpoint,export_policy,restore_optimizer,restore_rng)
 from .policy import ActorScorer
-from .route_data import (
-    MARKER_ID, load_pack, pack_manifest, parent_tokenizer, recipe, register_marker,
-    route_identity, source_checkpoint_lock, verify_artifact_identity, verify_parent,
-    verify_parent_identity, verify_tokenizer,
-)
+from .route_data import (MARKER_ID,load_pack,pack_manifest,parent_tokenizer,recipe,register_marker,
+    require,route_identity,source_checkpoint_lock,verify_artifact_identity,verify_parent,
+    verify_parent_identity,verify_tokenizer)
 from .sft_export import sft_manifest
-from .route_type_kl import (
-    TYPE_IDS, candidate_prefix, prepare_reference_cache, reference_to_student_kl,
-    type_log_probs, validate_config, verify_type_tokenizer,
-)
+from .route_type_kl import TYPE_IDS,THREEWAY_VERSION,good_threeway_kl,prepare_reference_cache,score_threeway,verify_type_ids
 
 
 def route_bce(logits, marker_id, is_bad):
@@ -39,110 +32,21 @@ class RouteScorer(ActorScorer):
         super().__init__(model, projection_chunk)
         self.type_ids = type_ids
 
-    def forward(self, input_ids, start, is_bad, marker_id, route_lambda,
-                type_kl_weight=0.0, reference_logp=None):
-        hidden = self.model.model(input_ids=input_ids, use_cache=False, return_dict=True)
-        # Only the supervised token predictors are projected. H/R remain in
-        # the attention context; no CE is imposed on their token positions.
-        states = hidden.last_hidden_state[0, start - 1:-1]
-        targets = input_ids[0, start:]
-
-        def ce_sum(state, ids):
-            return F.cross_entropy(self.model.lm_head(state).float(), ids, reduction="sum")
-
-        parts = [checkpoint(ce_sum, chunk, ids, use_reentrant=False) if torch.is_grad_enabled()
-                 else ce_sum(chunk, ids)
-                 for chunk, ids in zip(states.split(self.projection_chunk), targets.split(self.projection_chunk))]
-        ce = torch.stack(parts).sum() / len(targets)
-        first_logits = self.model.lm_head(states[0])
-        bce, probability = route_bce(first_logits, marker_id, is_bad)
-        loss = ce + route_lambda * bce
-        if not type_kl_weight:
-            # Exactly the original loss and forward graph when lambda=0.
-            return loss, ce.detach(), bce.detach(), probability.detach()
-        if reference_logp is None:
-            raise ValueError("Type KL requires a frozen reference distribution.")
-        # Run this graph even for Bad: conditional FSDP submodule calls on
-        # different ranks could otherwise deadlock. Bad contributes zero KL.
-        candidate = candidate_prefix(input_ids, start, self.type_ids)
-        alternate = self.model.model(input_ids=candidate, use_cache=False, return_dict=True)
-        after_open = self.model.lm_head(alternate.last_hidden_state[0, -1])
-        student_logp = type_log_probs(first_logits, after_open, self.type_ids)
-        kl = reference_to_student_kl(student_logp, reference_logp) * (1.0 - float(is_bad))
-        loss = loss + type_kl_weight * kl
-        return (loss, ce.detach(), bce.detach(), probability.detach(),
-                kl.detach(), student_logp[1].exp().detach())
-
-
-def update(actor, optimizer, rows, batch, cfg, rank, size, device, references=None):
-    batch_local = batch[rank::size]
-    if len(batch_local) != 2 or cfg["micro_batch"] != 1:
-        raise ValueError("Expected two unpadded samples on each of four ranks.")
-    optimizer.zero_grad(set_to_none=True)
-    stats = []
-    type_weight = validate_config(cfg)
-    # FSDP + accumulation average over B=8. Scale by B/G to obtain the
-    # intended mean over the six Good samples, not a diluted mean over eight.
-    good_scale = (cfg["good_per_batch"] + cfg["bad_per_batch"]) / cfg["good_per_batch"]
-    for i, k in enumerate(batch_local):
-        row = rows[k]
-        ctx = actor.no_sync() if hasattr(actor, "no_sync") and i + 1 < len(batch_local) else nullcontext()
-        with ctx:
-            ids = torch.tensor([row["input_ids"]], device=device, dtype=torch.long)
-            args = (ids, row["target_start"], row["route_label"], MARKER_ID, cfg["route_lambda"])
-            kl, p_answer, ref_answer = 0.0, 0.0, 0.0
-            if type_weight:
-                ref = ([-0.6931471805599453] * 2 if row["route_label"] else references[k])
-                ref = torch.tensor(ref, device=device, dtype=torch.float32)
-                loss, ce, bce, p, kl_value, answer_value = actor(*args, type_weight * good_scale, ref)
-                kl, p_answer, ref_answer = kl_value.item(), answer_value.item(), ref[1].exp().item()
-            else:
-                loss, ce, bce, p = actor(*args)
-            finite = torch.isfinite(loss.detach()).int()
-            if dist.is_initialized():
-                dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-            if not finite.item():
-                raise FloatingPointError("Non-finite Route-SFT loss; the last saved epoch is unchanged.")
-            # FSDP averages across ranks, each rank contributes two rows.
-            (loss / len(batch_local)).backward()
-        stats.append((row["route_label"], loss.detach().item(), ce.item(), bce.item(), p.item(),
-                      kl, p_answer, ref_answer))
-    clip = getattr(actor, "clip_grad_norm_", None)
-    norm = clip(cfg["clip_grad"]) if clip else torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg["clip_grad"])
-    if not torch.isfinite(norm).item():
-        raise FloatingPointError("Non-finite Route-SFT gradient; the last saved epoch is unchanged.")
-    optimizer.step()
-    return stats, float(norm)
-
-
-def run_epoch_export(out, step, actor, parent, rank, contract):
-    from transformers import AutoProcessor
-
-    folder = out / f"hf-step-{step:05d}"
-    if rank == 0:
-        already = model_ready(folder) and (folder / "completed.json").is_file()
-    else:
-        already = None
-    if gather(already)[0]:
-        if rank == 0:
-            done = read_json(folder / "completed.json")
-            if done != {"step": step, "algorithm": "route-sft", "contract": contract}:
-                raise ValueError("Existing Route-SFT export belongs to an incompatible run.")
-            receipt = folder / "export_sha256.json"
-            if not receipt.is_file():
-                write_json(receipt, sft_manifest(folder))
-        barrier()
-        return
-    replica = load_model(parent, torch.bfloat16, attention="sdpa") if rank == 0 else None
-    processor = AutoProcessor.from_pretrained(parent) if rank == 0 else None
-    if rank == 0:
-        register_marker(processor.tokenizer)
-    export_policy(folder, actor, replica, processor, step, rank,
-                  metadata={"algorithm": "route-sft", "contract": contract})
-    if rank == 0:
-        write_json(folder / "export_sha256.json", sft_manifest(folder))
-    barrier()
-
+    def forward(self, ids, start, is_bad, marker_id=MARKER_ID, route_lambda=0.1, *, branch="suffix", reference=None):
+        if branch == "kl":
+            require(not is_bad and reference is not None, "Only Good rows receive type KL.")
+            student = score_threeway(self.model, ids, start, self.type_ids)
+            return good_threeway_kl(student, torch.as_tensor(reference, dtype=torch.float32, device=ids.device))
+        require(branch == "suffix", "Unknown training branch.")
+        h=self.model.model(input_ids=ids,use_cache=False,return_dict=True).last_hidden_state[0,start-1:-1]
+        t=ids[0,start:]
+        def part(x,y):return F.cross_entropy(self.model.lm_head(x).float(),y,reduction='sum')
+        values=[checkpoint(part,x,y,use_reentrant=False) if torch.is_grad_enabled() else part(x,y)
+                for x,y in zip(h.split(self.projection_chunk),t.split(self.projection_chunk))]
+        ce=torch.stack(values).sum()/len(t)
+        z=self.model.lm_head(h[0]).float()
+        bce,prob=route_bce(z,marker_id,is_bad)
+        return ce+route_lambda*bce,ce.detach(),bce.detach(),prob.detach()
 
 def verify_route_export(path, cfg=None, expected_contract=None):
     cfg = cfg or recipe()
@@ -156,7 +60,7 @@ def verify_route_export(path, cfg=None, expected_contract=None):
     verify_artifact_identity(identity.get("manifest_sha256"), identity.get("artifact_sha256"), cfg)
     verify_parent_identity(identity.get("parent"), cfg)
     if expected_contract is not None and identity != expected_contract:
-        raise ValueError("Route-SFT export does not match the supplied 2B parent and v3 pack; use a new WORK.")
+        raise ValueError("Route-SFT export does not match the supplied 2B parent and v4 pack; use a new WORK.")
     receipt = read_json(path / "export_sha256.json") if (path / "export_sha256.json").is_file() else {}
     manifest = sft_manifest(path)
     if not receipt or manifest != receipt:
@@ -164,91 +68,108 @@ def verify_route_export(path, cfg=None, expected_contract=None):
     return {"completed": done, **manifest}
 
 
-def _loop(work, parent, data, rank, size, device):
-    from transformers import get_cosine_schedule_with_warmup
+def hardware_suggest(torch,device):
+    free,total=torch.cuda.mem_get_info(device)
+    require(torch.cuda.is_bf16_supported(),'SFT requires BF16 CUDA')
+    require(total>=29*2**30 and free>=min(total*0.85,58*(2**30)), 'Insufficient available GPU RAM for this single-rank profile')
+    # CPU offload is an implementation choice, not a different optimizer or quantization.
+    return {'world_size':1,'cpu_offload':total<65*2**30,'gpu_name':torch.cuda.get_device_name(device)}
 
-    cfg = recipe()
-    type_weight = validate_config(cfg)
-    m = pack_manifest(data, cfg)
-    parent_id = gather(verify_parent(parent, cfg) if rank == 0 else None)[0]
-    rows, batches = load_pack(data, cfg, m)
-    # The pack was captured by 8B. Replay its exact IDs only after checking
-    # the actual 2B training parent's tokenizer, not just the public base.
-    if rank == 0:
-        tokenizer = parent_tokenizer(parent)
-        verify_tokenizer(rows, tokenizer)
-        if type_weight:
-            verify_type_tokenizer(tokenizer)
-    barrier()
-    contract = route_identity(data, m, cfg, parent_id)
-    out = work / "route_sft"
-    if rank == 0:
-        out.mkdir(parents=True, exist_ok=True)
-        path = out / "contract.json"
-        if path.is_file() and read_json(path) != contract:
-            raise ValueError("Existing Route-SFT work directory has a different data/model/config identity.")
-        write_json(path, contract)
-    barrier()
-    total = len(batches) * cfg["epochs"]
-    cp = latest(out)
-    saved = load_checkpoint(cp) if cp else None
-    if saved and saved["contract"] != contract:
-        raise ValueError("Saved Route-SFT checkpoint has a different data/model/config identity.")
-    start = saved["step"] if saved else 0
-    if start not in range(0, total + 1, len(batches)):
-        raise ValueError("Expected a complete epoch checkpoint.")
-    references = (prepare_reference_cache(out, parent, rows, contract, rank, size, device)
-                  if type_weight and start < total else None)
-    random.seed(cfg["seed"] + rank)
-    torch.manual_seed(cfg["seed"] + rank)
-    actor = make_sharded_actor(parent, device, saved["actor"] if saved else None, scorer_type=RouteScorer)
-    optimizer = torch.optim.AdamW((p for p in actor.parameters() if p.requires_grad),
-                                  lr=cfg["lr"], betas=cfg["betas"], weight_decay=cfg["weight_decay"],
-                                  foreach=False)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, int(cfg["warmup_ratio"] * total), total)
-    if saved:
-        restore_optimizer(actor, optimizer, scheduler, saved, rank)
-        restore_rng(saved["rng"][rank], device)
-    del saved
-    actor.train()
-
-    # Recover an export if interruption happened after the training state commit.
-    if start:
-        run_epoch_export(out, start, actor, parent, rank, contract)
-    for index in range(start, total):
-        batch = batches[index % len(batches)]
-        stats, norm = update(actor, optimizer, rows, batch, cfg, rank, size, device, references)
-        scheduler.step()
-        step = index + 1
-        stats = gather(stats)
-        if rank == 0:
-            flat = [x for local in stats for x in local]
-            metrics = {"step": step, "epoch": (index // len(batches)) + 1,
-                       "lr": scheduler.get_last_lr()[0], "grad_norm": norm,
-                       "loss": fmean(x[1] for x in flat), "suffix_ce": fmean(x[2] for x in flat),
-                       "route_bce": fmean(x[3] for x in flat),
-                       "good_p_rethink": fmean(x[4] for x in flat if x[0] == 0),
-                       "bad_p_rethink": fmean(x[4] for x in flat if x[0] == 1)}
-            if type_weight:
-                good_stats = [x for x in flat if x[0] == 0]
-                metrics.update({"good_type_kl": fmean(x[5] for x in good_stats),
-                                "weighted_type_kl": type_weight * fmean(x[5] for x in good_stats),
-                                "good_student_p_answer": fmean(x[6] for x in good_stats),
-                                "good_reference_p_answer": fmean(x[7] for x in good_stats)})
-            write_json(out / "metrics" / f"step-{step:05d}.json", metrics)
-            if step == 1 or step % 5 == 0 or step % len(batches) == 0:
-                print(metrics, flush=True)
-        if step % len(batches) == 0:
-            save_checkpoint(out, actor, optimizer, scheduler, step, contract, rank, device, keep=2, verify=True)
-            run_epoch_export(out, step, actor, parent, rank, contract)
-    if rank == 0:
-        print(f"Route-SFT complete at {out / f'hf-step-{total:05d}'}", flush=True)
-    barrier()
+def update(actor,opt,rows,bb,cfg,device,references,marker_id=MARKER_ID):
+    """One update: eight suffix/BCE gradients and six independently averaged Good KL gradients."""
+    opt.zero_grad(set_to_none=True)
+    jobs=[(idx,branch) for idx in bb for branch in (('suffix','kl_branch')
+          if rows[idx]['route_label']==0 else ('suffix',))]
+    sums=[];ces=[];bces=[];pp={0:[],1:[]};kls=[]
+    for ii,(idx,branch) in enumerate(jobs):
+        r=rows[idx];bad=r['route_label'];startpos=r['target_start']
+        # Separate CE and Good-only KL backward: bound peak RAM, then a single common optimizer step.
+        ids=torch.tensor([r['input_ids'] if branch=='suffix' else r['input_ids'][:startpos]],dtype=torch.long,device=device)
+        with actor.no_sync() if ii+1<len(jobs) and hasattr(actor, "no_sync") else nullcontext():
+            if branch=='suffix':
+                raw,ce,bce,prob=actor(ids,startpos,bad,marker_id,cfg['route_lambda'])
+                loss=raw/len(bb)
+                ces.append(ce.detach().item());bces.append(bce.detach().item());pp[bad].append(prob.item())
+            else:
+                kl=actor(ids,startpos,bad,branch="kl",reference=references[idx])
+                loss=cfg['good_type_kl_lambda']*kl/cfg['good_per_batch'];kls.append(kl.detach().item())
+            if not torch.isfinite(loss).item():raise FloatingPointError('Non-finite route loss')
+            sums.append(loss.detach().item());loss.backward()
+    norm=(actor.clip_grad_norm_(cfg['clip_grad']) if hasattr(actor, 'clip_grad_norm_') else
+          torch.nn.utils.clip_grad_norm_(actor.parameters(), cfg['clip_grad']))
+    if not torch.isfinite(norm).item():raise FloatingPointError('Non-finite route gradient')
+    opt.step()
+    metrics=dict(loss=sum(sums),suffix_ce=fmean(ces),route_bce=fmean(bces),
+                 good_p_rethink=fmean(pp[0]),bad_p_rethink=fmean(pp[1]),grad_norm=float(norm))
+    if kls:metrics.update(good_threeway_kl=fmean(kls),weighted_kl=cfg['good_type_kl_lambda']*fmean(kls))
+    return metrics
 
 
 def worker(work, parent, data):
-    rank, size, device = initialize()
+    from transformers import get_cosine_schedule_with_warmup, AutoProcessor
+    cfg=recipe()
+    require((cfg['epochs'],cfg['batches_per_epoch'],cfg['world_size'],cfg['good_per_batch'],cfg['bad_per_batch'],
+             cfg['micro_batch'],cfg['good_type_kl_lambda'],cfg['good_type_kl_version']) ==
+            (2,281,1,6,2,1,0.1,THREEWAY_VERSION),'Incompatible two-epoch Good-type-KL recipe.')
+    m=pack_manifest(data,cfg)
+    rows,batches=load_pack(data,cfg,m)
+    c=route_identity(data,m,cfg,verify_parent(parent,cfg))
+    tok=parent_tokenizer(parent)
+    verify_type_ids(tok)
+    verify_tokenizer(rows,tok)
+    del tok
+    rank,size,device=initialize(world_size=1)
     try:
-        _loop(work, parent, data, rank, size, device)
+        prof=hardware_suggest(torch,device)
+        out=work.resolve()/'route_sft';out.mkdir(parents=True,exist_ok=True)
+        hardware={'world_size':1,'cpu_offload':prof['cpu_offload']}
+        if (out/'hardware.json').exists():require(hardware==read_json(out/'hardware.json'), 'Resume hardware profile mismatch.')
+        write_json(out/'hardware.json',hardware)
+        known={out/'checkpoint-00281', out/'checkpoint-00562'}
+        require(set(out.glob('checkpoint-*'))<=known,'Unrelated checkpoint in output folder; refusing to overwrite or prune')
+        cp=latest(out)
+        if cp:require((cp/'state_sha256.json').is_file(),'Unaudited prior training checkpoint')
+        if (out/'contract.json').exists():require(c==read_json(out/'contract.json'),'Run directory contract differs.')
+        if not cp:require(not any(out.glob('metrics/step-*.json')), 'Partial prior training found without a resumable checkpoint; use a fresh output root')
+        write_json(out/'contract.json',c)
+        cfg=c['config']; total=len(batches)*cfg['epochs']
+        require(total==562 and len(batches)==281,'Wrong epoch mapping')
+        need={None:58,'checkpoint-00281':35,'checkpoint-00562':9}[cp.name if cp else None]
+        require(shutil.disk_usage(out).free >= need*2**30,f'Not enough disk; need >= {need} GiB for outstanding saves.')
+        saved=load_checkpoint(cp) if cp else None;start=saved['step'] if saved else 0
+        require(not saved or (saved['contract']==c and start in (281,total) and cp.name==f'checkpoint-{start:05d}'),'Invalid saved state')
+        references=None
+        if start<total:
+            references=prepare_reference_cache(out,parent,rows,c,rank,size,device)
+        random.seed(cfg['seed']);torch.manual_seed(cfg['seed'])
+        actor=make_sharded_actor(parent,device,saved['actor'] if saved else None,scorer_type=RouteScorer,
+                                 cpu_offload=prof['cpu_offload'])
+        opt=torch.optim.AdamW((p for p in actor.parameters() if p.requires_grad),lr=cfg['lr'],betas=cfg['betas'],
+                              weight_decay=cfg['weight_decay'],foreach=False)
+        sched=get_cosine_schedule_with_warmup(opt,int(cfg['warmup_ratio']*total),total)
+        if saved:
+            restore_optimizer(actor,opt,sched,saved,rank);restore_rng(saved['rng'][rank],device)
+        del saved
+        actor.train()
+        for j in range(start,total):
+            epoch0,batch0=divmod(j,len(batches))
+            bb=batches[batch0]
+            metrics=update(actor,opt,rows,bb,cfg,device,references)
+            sched.step(); n=j+1
+            metrics.update(step=n,epoch=epoch0+1,batch_in_epoch=batch0+1,lr=sched.get_last_lr()[0])
+            write_json(out/'metrics'/f'step-{n:05d}.json',metrics)
+            if n==1 or n%5==0 or n==total:print(metrics,flush=True)
+            if n%len(batches)==0:save_checkpoint(out,actor,opt,sched,n,c,rank,device,keep=2,verify=True)
+        del opt,sched;gc.collect();torch.cuda.empty_cache()
+        hf=out/f'hf-step-{total:05d}'
+        if not hf.exists():
+            rep=load_model(parent,torch.bfloat16,attention='sdpa')
+            proc=AutoProcessor.from_pretrained(parent,local_files_only=True);register_marker(proc.tokenizer)
+            export_policy(hf,actor,rep,proc,total,rank,metadata={'algorithm':'route-sft','contract':c})
+        require(read_json(hf/'completed.json')=={'step':total,'algorithm':'route-sft','contract':c},'Wrong HF export')
+        receipt=sft_manifest(hf)
+        if (hf/'export_sha256.json').is_file():require(receipt==read_json(hf/'export_sha256.json'),'HF digest mismatch')
+        else:write_json(hf/'export_sha256.json',receipt)
+        print('COMPLETE',hf,flush=True)
     finally:
         dist.destroy_process_group()

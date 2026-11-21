@@ -1,6 +1,7 @@
 /.deps/
 /.venv*/
 /work/
+/work-281x2/
 /.env
 /.env.*
 /private_inputs/

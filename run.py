@@ -4,16 +4,30 @@ from pathlib import Path
 import subprocess
 import sys
 
-from genevolve_repro.common import ROOT, WORLD_SIZE, load_upstream, required_env
+from genevolve_repro.common import ROOT, WORLD_SIZE, load_upstream, read_json, required_env
 from genevolve_repro.sft_export import export_files, file_sha256, sft_manifest
 
 
 def distributed(subcommand, work, *arguments):
+    # Stage one and its matched evaluation use the first visible GPU. Stage
+    # two continues to see all four assigned GPUs and uses its original ranks.
+    workers = 1 if subcommand in {"_route-sft", "_eval"} else WORLD_SIZE
     subprocess.run([
         sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
-        f"--nproc-per-node={WORLD_SIZE}", str(ROOT / "run.py"),
+        f"--nproc-per-node={workers}", str(ROOT / "run.py"),
         "--work", str(work), subcommand, *arguments,
     ], cwd=ROOT, check=True)
+
+
+def default_eval_cases():
+    return read_json(ROOT / "configs" / "evaluation.json")["max_cases"]
+
+
+def final_route_export(work, cfg=None):
+    from genevolve_repro.route_data import recipe
+
+    cfg = recipe() if cfg is None else cfg
+    return work / "route_sft" / f"hf-step-{cfg['batches_per_epoch'] * cfg['epochs']:05d}"
 
 
 def evaluation_arguments(args):
@@ -22,13 +36,19 @@ def evaluation_arguments(args):
         result.extend(["--policy", str(args.policy.resolve())])
     if args.max_cases is not None:
         result.extend(["--max-cases", str(args.max_cases)])
+    else:
+        result.append("--full-benchmark")
     return result
 
 
 def eval_flags(parser):
     parser.add_argument("--split", choices=["bench", "rl-val", "wise"], default="bench")
-    parser.add_argument("--policy", type=Path, help="HF export (default: WORK/rethink/final)")
-    parser.add_argument("--max-cases", type=int, help="Limit a live evaluation for a pilot")
+    parser.add_argument("--policy", type=Path, help="HF export (default: final 562-step Route-SFT export)")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--max-cases", type=int, default=default_eval_cases(),
+                       help="Fixed prefix of the pinned split (default: its first 8 cases)")
+    scope.add_argument("--full-benchmark", dest="max_cases", action="store_const", const=None,
+                       default=argparse.SUPPRESS, help="Explicitly evaluate the entire selected split")
 
 
 def check_rethink_services():
@@ -67,7 +87,7 @@ def run_pipeline(args, work):
     pack = pack_manifest(data, cfg)
     contract = route_identity(data, pack, cfg, parent_id)
     total = cfg["batches_per_epoch"] * cfg["epochs"]
-    route_export = work / "route_sft" / f"hf-step-{total:05d}"
+    route_export = final_route_export(work, cfg)
     route_ready = all((route_export / name).is_file() for name in ("completed.json", "export_sha256.json"))
     if not route_ready:
         preflight("route-sft", work)
@@ -90,8 +110,8 @@ def run_pipeline(args, work):
     execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps,
                                route_contract=contract), work)
     if args.eval:
-        print("Final evaluation: GenEvolve-Bench (594 cases)", flush=True)
-        execute(argparse.Namespace(command="eval", split="bench", max_cases=None,
+        print("Final stage-2 evaluation: fixed 8-case GenEvolve-Bench subset", flush=True)
+        execute(argparse.Namespace(command="eval", split="bench", max_cases=default_eval_cases(),
                                    policy=work / "rethink" / "final"), work)
 
 
@@ -129,12 +149,29 @@ def execute(args, work):
         prepare_embedding(work)
     if args.command == "route-sft":
         from genevolve_repro.route_data import pack_manifest, recipe
+        from genevolve_repro.route_sft import verify_route_export
         from genevolve_repro.runtime import preflight
 
         data = route_data_folder(work, args.data)
-        pack_manifest(data, recipe())
+        cfg = recipe()
+        pack_manifest(data, cfg)
+        evaluate_final = getattr(args, "eval", False)
+        if evaluate_final:
+            # Resolve all required bench data *before* the long training job.
+            from genevolve_repro.data import prepare, verify_data
+            required_env("SERPER_API_KEY")
+            required_env("JUDGE_API_KEY")
+            try:
+                verify_data(work)
+            except (ValueError, FileNotFoundError):
+                prepare(work)
         preflight("route-sft", work)
         distributed("_route-sft", work, "--parent", str(args.parent.resolve()), "--data", str(data))
+        if evaluate_final:
+            export = final_route_export(work, cfg)
+            verify_route_export(export)
+            execute(argparse.Namespace(command="eval", policy=export, split="bench",
+                                       max_cases=default_eval_cases()), work)
     if args.command in {"grpo", "rethink"}:
         from genevolve_repro.runtime import preflight
 
@@ -144,7 +181,9 @@ def execute(args, work):
             flags.extend(["--steps", str(args.steps)])
         distributed("_" + args.command, work, *flags)
     if args.command == "eval":
-        export_files(args.policy.resolve() if args.policy else work / "rethink" / "final")
+        if args.policy is None:
+            args.policy = final_route_export(work)
+        export_files(args.policy.resolve())
         distributed("_eval", work, *evaluation_arguments(args))
 
 
@@ -155,12 +194,12 @@ def sft_flag(parser):
 
 def route_flags(parser, *, internal=False):
     parser.add_argument("--data", required=internal, type=Path,
-                        help="verified Route-SFT directory (default: download the public reviewed v3 pack)")
+                        help="verified 281-batch Route-SFT pack (default: use the pinned public release)")
     parser.add_argument("--parent", required=True, type=Path, help="matching GenEvolve 2B SFT checkpoint-550 HF export")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenEvolve 2B Route-SFT and RETHINK-routed native SDL on four GPUs")
+    parser = argparse.ArgumentParser(description="GenEvolve 2B: one-GPU two-epoch Route-SFT, four-GPU native SDL")
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
@@ -170,9 +209,13 @@ def main():
     pipeline = commands.add_parser("all", help="prepare data and run both method stages")
     route_flags(pipeline)
     pipeline.add_argument("--steps", type=int, help="planned stage-2 updates (default: 322, same as the baselines)")
-    pipeline.add_argument("--eval", action="store_true", help="also score the final policy on the full benchmark")
+    pipeline.add_argument("--eval", action="store_true", help="also score the final stage-2 policy on the fixed eight cases")
     for name in ("check-route", "route-sft", "_route-sft"):
-        route_flags(commands.add_parser(name), internal=name == "_route-sft")
+        parser_stage = commands.add_parser(name)
+        route_flags(parser_stage, internal=name == "_route-sft")
+        if name == "route-sft":
+            parser_stage.add_argument("--eval", action="store_true",
+                                      help="after update 562 ONLY: evaluate the final checkpoint on the fixed eight cases")
     for name in ("grpo", "_grpo", "rethink", "_rethink"):
         stage = commands.add_parser(name)
         sft_flag(stage)
@@ -199,7 +242,7 @@ def main():
             rows, batches = load_pack(data, cfg, m)
             verify_tokenizer(rows, parent_tokenizer(args.parent.resolve()))
             print(json.dumps({"parent": parent, "trajectory_source": "8B", "route_data": str(data),
-                              "route_data_variant": m.get("release_variant", "reviewed-v3-original"),
+                              "route_data_variant": m.get("release_variant", m["schema"]),
                               "route_manifest_sha256": file_sha256(data / "manifest.json"),
                               "rows": len(rows), "batches": len(batches), "updates": len(batches) * cfg["epochs"],
                               "max_tokens": max(len(row["input_ids"]) for row in rows),
@@ -214,7 +257,7 @@ def main():
         worker(work, args.sft_checkpoint.resolve(), args.steps, rethink=args.command == "_rethink")
     elif args.command == "_eval":
         from genevolve_repro.evaluate import worker
-        policy = args.policy.resolve() if args.policy else work / "rethink" / "final"
+        policy = args.policy.resolve() if args.policy else final_route_export(work)
         worker(work, policy, args.split, args.max_cases)
     else:
         from filelock import FileLock, Timeout

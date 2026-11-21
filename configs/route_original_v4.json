@@ -1,0 +1,6 @@
+{
+  "schema": "genevolve-route-sft-6g2b-v4-finish-reviewed",
+  "manifest_sha256": "71b20aa7d45de7af3e7aa9f73f3bdceca57c9c3cf53944c0b2eb61f0b72b7c05",
+  "train_sha256": "012ddfc1d11b7b9a6b155ed10e72210c7d90ceea7c367d713e6dd754be4dc32e",
+  "batches_sha256": "80d165ff770e87cdf39045194d84bb432468159652a2e4a91929c6dd20ca00a4"
+}

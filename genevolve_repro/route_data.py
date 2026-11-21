@@ -34,8 +34,11 @@ def release_artifacts(digest, cfg):
 
 def verify_artifact_identity(digest, artifacts, cfg):
     public = release_artifacts(digest, cfg)
-    if public is not None:
-        require(artifacts == public, "Route-SFT release files do not match the pinned SHA-256.")
+    if public is None:
+        locked = read_json(ROOT / "configs/route_original_v4.json")
+        require(digest == locked["manifest_sha256"], "Wrong original v4 manifest.")
+        public = {name + ".jsonl": locked[name + "_sha256"] for name in ("train", "batches")}
+    require(artifacts == public, "Route-SFT files do not match the pinned SHA-256.")
 
 
 def pack_manifest(folder, cfg):
@@ -49,22 +52,23 @@ def pack_manifest(folder, cfg):
         "good": cfg["batches_per_epoch"] * cfg["good_per_batch"],
         "bad": cfg["batches_per_epoch"] * cfg["bad_per_batch"],
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL, "marker_id": MARKER_ID,
-        "eos_id": EOS_ID, "ordered_batches": True, "retokenized_input_history": public is not None,
+        "eos_id": EOS_ID, "ordered_batches": True,
         "history_truncation": False, "official_split_overlap_exact_normalized": 0,
     }.items():
         require(m.get(key) == expected, f"Unexpected Route-SFT manifest field: {key}.")
     if public is not None:
-        require(m.get("release_variant") == "reviewed-v3-public"
+        require(m.get("release_variant") == "reviewed-v4-public" and m.get("retokenized_input_history") is True
                 and m.get("original_manifest_sha256") == cfg["manifest_sha256"]
-                and m.get("supervision_identical_to_reviewed_v3") is True
+                and m.get("supervision_identical_to_reviewed_v4") is True
                 and m.get("artifact_sha256") == public, "Public Route-SFT provenance differs.")
     require(m["checkpoint550_file_sha256"] == source_checkpoint_lock(),
             "Route-SFT collection provenance does not match the sealed 8B source.")
+    verify_artifact_identity(digest, {n: m["artifact_sha256"][n] for n in ("train.jsonl","batches.jsonl")}, cfg)
     return m
 
 
 def source_checkpoint_lock():
-    """The weights that generated the v3 examples, not the 2B training start."""
+    """The weights that generated the natural examples, not the 2B training start."""
     return read_json(ROOT / "configs" / "route_data_source_8b_sha256.json")
 
 
@@ -80,6 +84,7 @@ def verify_parent_identity(identity, cfg=None):
             and all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value)
                     for value in hashes.values()),
             "Incomplete 2B parent fingerprint.")
+    require(identity == read_json(ROOT / "configs/sft550_sha256.json"), "Weights/tokenizer differ from the exact SFT-550 parent.")
     return identity
 
 
@@ -195,4 +200,6 @@ def route_identity(folder, m, cfg, parent_identity):
         "parent": verify_parent_identity(parent_identity, cfg),
         "route_data_source_sha256": m["checkpoint550_file_sha256"],
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL,
+        "objective": "original+good_3way_forward_KL",
+        "schedule_steps": 562, "save_resumable_at": [281, 562], "export_hf_at": [562],
     }

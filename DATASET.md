@@ -1,16 +1,44 @@
-# GenEvolve Route-SFT reviewed v3 — public training pack
+# GenEvolve Route-SFT v4: the 281-batch library
 
-Download [this repository's public dataset Release](https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x/releases/tag/route-sft-reviewed-v3-public), or run from a checkout of this repository:
+This is a derived GenEvolve training-decision dataset; it is **not** the official benchmark. Its 2,248 distinct decisions are arranged in **281 fixed, ordered batches**, each with 6 Good and 2 Bad decisions. One epoch consumes each row once. Two epochs repeat that same order: 562 optimizer updates and 4,496 row presentations. No held-out benchmark example is intentionally used for SFT and there is no separate SFT validation split in this pack.
+
+| Label | Unique examples | Origin |
+|---|---:|---|
+| Good | 1,686 | Natural decisions, with the original sampled action |
+| Bad | 562 | 319 original natural errors + 54 natural resamples + 189 reviewed synthetic same-state contrasts |
+
+**The 8B model hash in the data manifest identifies the trajectory collector, not the training parent.** Training starts from the separately pinned **2B SFT-550**. Files from the old 297-batch v3 release, the natural-only 186-batch experiment, or the alternative recovery library are not interchangeable.
+
+## Obtain the data
+
+Use the [pinned v4 dataset release](https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x/releases/tag/route-sft-reviewed-v4-public). For an automatic anonymous download and verification:
 
 ```bash
 python -m pip install filelock==3.20.0
 python run.py --work "$WORK" prepare-route
 ```
 
-Only the three files needed by Route-SFT are in the archive: `manifest.json`, `train.jsonl` and `batches.jsonl`. The archive and each file are pinned by [size and SHA-256](configs/route_release.json). The fetch command validates hashes, row boundaries and batch membership without model weights, GPUs or API credentials. Use `check-route --parent "$PARENT"` to also check the actual training parent's tokenizer.
+For an offline machine, download **genevolve-route-sft-reviewed-v4-public.zip**, extract its three root-level files into one directory, then pass that directory via `--data` to `check-route` or `route-sft`. Do not repack, reorder or reformat any member:
 
-The sample pool contains **2,376** decisions (1,782 Good, 594 Bad) in **297 ordered 6:2 batches**, from the reviewed v3 selections. A Bad sample includes a natural error or a reviewed same-history contrast. Only continuation tokens and the route boundary are supervised. There is no additional validation split in this pack. The reference origin is [GenEvolve](https://github.com/MeiGen-AI/GenEvolve/tree/23c847c559ccc0f95bbf4b3d8925898463822f4c) and its [official Apache-2.0 data](https://huggingface.co/datasets/MeiGen-AI/GenEvolve-Data-Bench/tree/9f291879d5dfe1195f47883e23069d3f6e829afe). These are derived training decisions, not an author-provided GenEvolve dataset. The offline collection checkpoint was 8B; the matched model trained here is the 2B SFT-550.
+```bash
+python run.py --work "$WORK" check-route --data "$PACK" --parent "$PARENT"
+```
 
-For publication, machine-specific path values, URL access parameters and contact addresses were removed only from prior tool responses. The changed history tokens and supervision offsets were recomputed with the pinned 2B tokenizer. The sample IDs, batch order, labels, current reasoning, and **all supervised token IDs** are unchanged from reviewed v3. The public pack is not byte-identical to the original private archive. It contains no rendered images, model weights, raw rollout archives, or private annotation logs. Official RL and evaluation splits are unchanged and are fetched separately with `prepare`.
+`manifest.json` records the training contract and provenance; `train.jsonl` contains the model-visible messages, native tokens, mask and supervision boundary; `batches.jsonl` records explicit row indices and decision IDs. Only those three files are in the ZIP. [Archive and member checksums](configs/route_release.json) are enforced. Raw trajectories, rendered/reference images, API credentials, optimizer state, audit logs and excluded/reserve examples are **not** bundled.
 
-Start a fresh `WORK` when switching from the original v3 export to the public pack. For a previous run that used the original archive, keep the original `--data` argument. Checkpoints and their stage-2 handoff record the actual manifest and file digests.
+## Public versus original inputs
+
+The public download is the privacy-cleaned counterpart of the exact pack used in the reported run. A runtime filesystem path, address or URL access parameter in earlier tool feedback can leak even if only **token IDs** are published. Such strings are removed or replaced in tool messages; affected historical token prefixes, the position of the routing boundary and the ignored portion of the labels are recomputed using the pinned tokenizer. The current reasoning, the entire continuation after the history, supervised action tokens, Good/Bad labels, paired relationships, row identities and all 281 batches are unchanged. Public inputs must **not** be described as byte-identical to the reported run.
+
+| Whole-pack privacy/equivalence check | Verified result |
+|---|---:|
+| Rows with changed history / rows with entirely unchanged input IDs | 1,679 / 569 |
+| Tool-feedback replacements (runtime paths / URL access parameters / contact addresses, counting repeated occurrences) | 5,672 / 6 / 3 |
+| Total history tokens, original → public | 10,946,238 → 10,543,499 |
+| Supervised tokens per epoch, original = public | 233,323 (zero changed) |
+| Current reasoning prefixes changed / supervised actions changed | 0 / 0 |
+| Fixed batch files | Byte-identical |
+
+If you already have authorized access to the **original unmodified v4** pack, supply its three training files with the same `--data "$PACK"` option and use a fresh `WORK`. [Its independent original-file hashes](configs/route_original_v4.json) select the exact historical data path; no arbitrary directory is accepted. The public and original manifest hashes are different. Do not attempt to resume a checkpoint trained with one using the other.
+
+Upstream: [GenEvolve source](https://github.com/MeiGen-AI/GenEvolve/tree/23c847c559ccc0f95bbf4b3d8925898463822f4c) and [GenEvolve benchmark data](https://huggingface.co/datasets/MeiGen-AI/GenEvolve-Data-Bench/tree/9f291879d5dfe1195f47883e23069d3f6e829afe). Official train/RL and benchmark downloads are separate from this Route-SFT decision pack.

@@ -83,7 +83,8 @@ class ContractTest(unittest.TestCase):
         with TemporaryDirectory() as temp:
             path = Path(temp) / "parent"
             fake_export(path)
-            self.assertEqual(verify_parent(path), sft_manifest(path))
+            with self.assertRaisesRegex(ValueError, 'exact SFT-550 parent'):
+                verify_parent(path)
             write_json(path / "trainer_state.json", {"global_step": 549})
             with self.assertRaisesRegex(ValueError, "SFT checkpoint-550"):
                 verify_parent(path)

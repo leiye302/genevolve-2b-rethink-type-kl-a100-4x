@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import (
     CPUOffload, FullOptimStateDictConfig, FullStateDictConfig,
-    FullyShardedDataParallel as FSDP, MixedPrecision, StateDictType,
+    FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
@@ -20,10 +20,11 @@ from .policy import ActorScorer
 from .sft_export import file_sha256
 
 
-def initialize():
+def initialize(world_size=None):
     rank, size = int(os.environ["LOCAL_RANK"]), int(os.environ["WORLD_SIZE"])
-    if size != WORLD_SIZE or torch.cuda.device_count() < WORLD_SIZE:
-        raise RuntimeError(f"Expose four CUDA GPUs and start the worker through run.py.")
+    expected = WORLD_SIZE if world_size is None else world_size
+    if size != expected or torch.cuda.device_count() < expected:
+        raise RuntimeError(f"Expose {expected} CUDA GPU(s) and start the worker through run.py.")
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", timeout=timedelta(hours=2), device_id=device)
@@ -38,7 +39,7 @@ def load_model(path, dtype, attention="flash_attention_2"):
     )
 
 
-def make_sharded_actor(path, device, saved=None, scorer_type=ActorScorer):
+def make_sharded_actor(path, device, saved=None, scorer_type=ActorScorer, *, cpu_offload=True):
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextDecoderLayer
 
     # Load the attention backend after loading FP32 master weights. FSDP
@@ -55,9 +56,12 @@ def make_sharded_actor(path, device, saved=None, scorer_type=ActorScorer):
         device_id=device,
         auto_wrap_policy=partial(transformer_auto_wrap_policy,
                                  transformer_layer_cls={Qwen3VLTextDecoderLayer}),
-        use_orig_params=True,
+        # NO_SHARD + tied weights + mixed-precision accumulation can attach a
+        # BF16 shared gradient to an FP32 original view in torch 2.8. Keep flat
+        # parameter ownership on one rank; FP32 masters/BF16 compute are unchanged.
+        use_orig_params=not (dist.is_initialized() and dist.get_world_size() == 1),
         mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32),
-        cpu_offload=CPUOffload(offload_params=True),
+        cpu_offload=CPUOffload(offload_params=cpu_offload),
         ignored_modules=[policy.model.visual],
         limit_all_gathers=True,
     )
@@ -70,10 +74,13 @@ def copy_actor(sharded, target, rank0_only=False):
     if not isinstance(sharded, FSDP):
         target.load_state_dict(sharded.model.state_dict())
         return
-    # For CPU/Gloo smoke tests, the gathered parameters are already on CPU.
-    # Torch 2.8's CPU offload context assumes a device-to-host copy.
+    # CPU parameters need no offload; Torch also rejects summon_full_params
+    # offload for NO_SHARD (including a single CUDA rank). Copies into a CPU
+    # replica still happen below, without changing the trained weights.
+    offload = (sharded.compute_device.type != "cpu"
+               and sharded.sharding_strategy != ShardingStrategy.NO_SHARD)
     with FSDP.summon_full_params(
-        sharded, writeback=False, offload_to_cpu=sharded.compute_device.type != "cpu", rank0_only=rank0_only,
+        sharded, writeback=False, offload_to_cpu=offload, rank0_only=rank0_only,
     ):
         if not rank0_only or dist.get_rank() == 0:
             source = {

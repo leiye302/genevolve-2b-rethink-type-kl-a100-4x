@@ -304,7 +304,7 @@ class RethinkTest(unittest.TestCase):
         with TemporaryDirectory() as temp, patch.multiple(
             evolve, load_upstream=lambda: None, required_env=lambda _: "offline-fixture",
             embedding_ready=lambda _: True, examples=lambda *_: [example] * 2575, verify_split=lambda *_: "fixture-sha",
-            verify_route_export=lambda _: {"completed": 297}, make_sharded_actor=lambda *args: actor,
+            verify_route_export=lambda _: {"completed": 562}, make_sharded_actor=lambda *args: actor,
             load_model=lambda *args: deepcopy(actor), ActorScorer=lambda model: model,
             copy_actor=lambda src, dst: dst.load_state_dict(src.state_dict()), Embedder=lambda *_: lambda _: [1.0],
             LiveFeedback=lambda *args: feedback, make_agent=lambda *a, **k: None, gather_group=rollout,
@@ -340,14 +340,16 @@ class RethinkTest(unittest.TestCase):
             identity = {
                 "config": cfg, "manifest_sha256": cfg["manifest_sha256"],
                 "route_data_source_sha256": source_checkpoint_lock(),
-                "parent": verify_parent(parent),
+                "parent": read_json(ROOT / "configs/sft550_sha256.json"),
+                "artifact_sha256": {k+".jsonl": read_json(ROOT / "configs/route_original_v4.json")[k+"_sha256"]
+                                   for k in ("train","batches")},
             }
-            write_json(path / "completed.json", {"step": 297, "algorithm": "route-sft", "contract": identity})
+            write_json(path / "completed.json", {"step": 562, "algorithm": "route-sft", "contract": identity})
             write_json(path / "export_sha256.json", sft_manifest(path))
-            self.assertEqual(verify_route_export(path, expected_contract=identity)["completed"]["step"], 297)
+            self.assertEqual(verify_route_export(path, expected_contract=identity)["completed"]["step"], 562)
             (parent / "model.safetensors").write_bytes(b"a different step 550 export")
             with self.assertRaisesRegex(ValueError, "supplied 2B parent"):
-                verify_route_export(path, expected_contract={**identity, "parent": verify_parent(parent)})
+                verify_route_export(path, expected_contract={**identity, "parent": sft_manifest(parent)})
             (path / "model.safetensors").write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 verify_route_export(path)

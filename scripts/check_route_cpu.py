@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from genevolve_repro.common import source_lock, write_json
 from genevolve_repro.route_data import MARKER_ID, load_pack, recipe, register_marker, verify_tokenizer
 from genevolve_repro.route_release import prepare_route
-from genevolve_repro.route_type_kl import score_reference, verify_type_tokenizer
+from genevolve_repro.route_type_kl import score_threeway, verify_type_ids
 from genevolve_repro.sft_export import file_sha256
 
 
@@ -37,7 +37,7 @@ def main():
                                       'chat_template.jinja', 'merges.txt', 'vocab.json', 'config.json'])
     tokenizer = register_marker(AutoTokenizer.from_pretrained(tokenizer_dir, local_files_only=True))
     verify_tokenizer(rows, tokenizer)
-    verify_type_tokenizer(tokenizer)
+    verify_type_ids(tokenizer)
     counts = Counter((r['route_label'], r['target_action_kind']) for r in rows)
     print({'verified_rows': len(rows), 'batches': len(batches), 'types': str(counts)}, flush=True)
     torch.set_num_threads(4)
@@ -62,7 +62,7 @@ def main():
     eligible = [b for b in batches if len({kind(rows[k]) for k in b}) == 4]
     batch = min(eligible, key=lambda b: sum(len(rows[k]['input_ids']) +
                 8 * (len(rows[k]['input_ids']) - rows[k]['target_start']) for k in b))
-    refs = {k: score_reference(model, torch.tensor([rows[k]['input_ids']]), rows[k]['target_start']).detach()
+    refs = {k: score_threeway(model, torch.tensor([rows[k]['input_ids']]), rows[k]['target_start']).detach()
             for k in batch if not rows[k]['route_label']}
     model.train().requires_grad_(True)
     model.model.visual.requires_grad_(False)
@@ -78,13 +78,17 @@ def main():
         values = []
         for k in batch:
             row = rows[k]
-            ref = refs.get(k, torch.tensor([-0.69314718056] * 2))
-            loss, ce, bce, p, kl, answer = scorer(torch.tensor([row['input_ids']]), row['target_start'],
-                row['route_label'], MARKER_ID, cfg['route_lambda'], cfg['good_type_kl_lambda'] * 8 / 6, ref)
+            ids = torch.tensor([row['input_ids']]); start = row['target_start']
+            loss, ce, bce, p = scorer(ids, start, row['route_label'], MARKER_ID, cfg['route_lambda'])
             if not torch.isfinite(loss):
                 raise ValueError('Non-finite smoke loss.')
             (loss / len(batch)).backward()
-            values.append({'label': row['route_label'], 'loss': float(loss.detach()), 'kl': float(kl)})
+            kl = 0.0
+            if row['route_label'] == 0:
+                value = scorer(ids[:, :start], start, 0, branch="kl", reference=refs[k])
+                (cfg['good_type_kl_lambda'] * value / cfg['good_per_batch']).backward()
+                kl = value.detach().item()
+            values.append({'label': row['route_label'], 'loss': float(loss.detach()), 'kl': kl})
         norm = torch.nn.utils.clip_grad_norm_(scorer.parameters(), cfg['clip_grad'])
         if not torch.isfinite(norm):
             raise ValueError('Non-finite smoke gradient.')

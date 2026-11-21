@@ -1,69 +1,58 @@
-"""Linux four-rank FSDP with mixed labels, checkpointing and global Good mean."""
+"""The production Route-SFT profile is one rank; compare its accumulated update to the direct objective."""
 from copy import deepcopy
-from datetime import timedelta
-from pathlib import Path
-import sys
-from tempfile import TemporaryDirectory
 import unittest
 
 import torch
-import torch.distributed as dist
-
-from genevolve_repro.distributed import copy_actor
+from torch.nn import functional as F
 from genevolve_repro.route_sft import RouteScorer, update
-from genevolve_repro.route_type_kl import VERSION
-from test_distributed import sharded
-from test_pipeline import tiny_policy
+from genevolve_repro.route_data import recipe
+from genevolve_repro.route_type_kl import TYPE_IDS
+from test_rethink import ToyPolicy
 
 
-def rank_worker(rank, directory):
-    torch.set_num_threads(1)
-    folder = Path(directory)
-    device = torch.device('cpu')
-    dist.init_process_group('gloo', init_method=(folder / 'rendezvous').as_uri(), rank=rank,
-                            world_size=4, timeout=timedelta(seconds=120))
-    try:
-        torch.manual_seed(42)
-        policy = tiny_policy()
-        policy.set_attn_implementation('sdpa')
-        policy.model.visual.requires_grad_(False)
-        baseline = deepcopy(policy)
-        policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-        actor = sharded(RouteScorer(policy, type_ids=(6, 3, 4)), device)
-        reference = RouteScorer(baseline, type_ids=(6, 3, 4))
-        # Mixed ranks: 0,1 have one Good and one Bad; 2,3 have two Good.
-        rows = [dict(input_ids=[2, 5, 9, 6, 8, 2], target_start=3, route_label=int(i in (0, 5)))
-                for i in range(8)]
-        refs = {i: [float(x) for x in torch.tensor([0.3, 0.7]).log()] for i in range(8) if i not in (0, 5)}
-        cfg = dict(micro_batch=1, good_per_batch=6, bad_per_batch=2, route_lambda=0.1,
-                   clip_grad=1.0, good_type_kl_lambda=0.1, good_type_kl_version=VERSION)
-        optimizer = torch.optim.SGD(actor.parameters(), lr=0.02)
-        expected_optimizer = torch.optim.SGD(reference.parameters(), lr=0.02)
-        # route marker is intentionally within the tiny model's vocabulary.
-        import genevolve_repro.route_sft as module
-        module.MARKER_ID = 7
-        for iteration in range(2):
-            expected_optimizer.zero_grad(set_to_none=True)
-            for i, row in enumerate(rows):
-                ids = torch.tensor([row['input_ids']])
-                logp = torch.tensor(refs.get(i, [-0.69314718056] * 2))
-                loss = reference(ids, 3, row['route_label'], 7, 0.1, 0.1 * 8 / 6, logp)[0]
-                (loss / 8).backward()
-            expected_norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), 1.0)
-            expected_optimizer.step()
-            stats, norm = update(actor, optimizer, rows, list(range(8)), cfg, rank, 4, device, refs)
-            assert len(stats) == 2
-            torch.testing.assert_close(torch.tensor(norm), expected_norm, atol=3e-5, rtol=3e-5)
-            actual = tiny_policy()
-            copy_actor(actor, actual)
-            for a, b in zip(actual.parameters(), baseline.parameters()):
-                torch.testing.assert_close(a, b, atol=3e-5, rtol=3e-5)
-    finally:
-        dist.destroy_process_group()
+class SingleGpuObjectiveTest(unittest.TestCase):
+    def test_accumulated_update_matches_full_vocabulary_reference(self):
+        torch.set_num_threads(1)
+        torch.manual_seed(12)
+        cfg = recipe()
+        self.assertEqual((cfg["world_size"],cfg["epochs"],cfg["batches_per_epoch"]), (1,2,281))
+        model=ToyPolicy()
+        gold=deepcopy(model)
+        actor=RouteScorer(model,projection_chunk=2,type_ids=(2,3,4))
+        old_ref = torch.tensor([.30,.20,.50])
+        bad={1,6}
+        rows=[dict(input_ids=[11-i,9]+([7] if i in bad else [])+[2,12,10],
+                   target_start=2,route_label=int(i in bad)) for i in range(8)]
+        refs={i:old_ref.log().tolist() for i in range(8) if i not in bad}
+        opt=torch.optim.SGD(actor.parameters(),lr=.005)
+        goldopt=torch.optim.SGD(gold.parameters(),lr=.005)
+        metrics=update(actor,opt,rows,list(range(8)),cfg,'cpu',refs,marker_id=7)
+        losses=[]
+        for i,row in enumerate(rows):
+            badrow=row['route_label']; ids=torch.tensor([row["input_ids"]]); pos=row["target_start"]
+            z=gold.lm_head(gold.model(ids).last_hidden_state[0,pos-1:-1])
+            log=z[0].log_softmax(0)
+            bce= -log[7] if badrow else -torch.log1p(-log[7].exp())
+            losses.append((F.cross_entropy(z,ids[0,pos:]) + .1*bce) / 8)
+            if not badrow:
+                grow=gold.lm_head(gold.model(torch.cat((ids[:,:pos],torch.tensor([[3]])),1)).last_hidden_state[0,-1])
+                p=log.exp(); pa=p[3]*grow.softmax(0)[4]
+                legal=torch.stack([p[2],pa,1-p[2]-pa])
+                kl=torch.sum(old_ref*(old_ref.log()-legal.log()))
+                losses.append(.1*kl/6)
+        objective=sum(losses)
+        objective.backward()
+        torch.nn.utils.clip_grad_norm_(gold.parameters(),cfg['clip_grad'])
+        goldopt.step()
+        self.assertAlmostEqual(metrics['loss'],objective.item(),places=5)
+        for trained,expected in zip(model.parameters(),gold.parameters()):
+            torch.testing.assert_close(trained,expected,rtol=1e-5,atol=1e-7)
+
+    def test_no_bad_kl_branch(self):
+        actor=RouteScorer(ToyPolicy(),type_ids=(2,3,4))
+        with self.assertRaisesRegex(ValueError,'Only Good'):
+            actor(torch.tensor([[3,2]]),2,1,branch='kl',reference=[-1.]*3)
+        self.assertEqual(TYPE_IDS,(151657,27,9217))
 
 
-class DistributedTypeKLTest(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == 'linux' and dist.is_gloo_available(), 'Linux Gloo required')
-    def test_four_ranks_two_updates_match_global_reference(self):
-        with TemporaryDirectory() as directory:
-            torch.multiprocessing.spawn(rank_worker, args=(directory,), nprocs=4)
+if __name__=='__main__':unittest.main()
