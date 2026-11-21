@@ -1,4 +1,5 @@
 import argparse
+from contextlib import ExitStack, nullcontext
 import os
 from pathlib import Path
 import sys
@@ -27,6 +28,42 @@ def fake_export(folder):
 
 
 class ContractTest(unittest.TestCase):
+    def test_stage1_hardware_accepts_only_four_available_bf16_a100_80gb(self):
+        from genevolve_repro.runtime import preflight
+
+        gib = 2**30
+        cases = [
+            (4, "NVIDIA A100-SXM4-80GB", 79, 74, True, None),
+            (1, "NVIDIA A100-SXM4-80GB", 79, 74, True, "exactly four visible"),
+            (8, "NVIDIA A100-SXM4-80GB", 79, 74, True, "exactly four visible"),
+            (4, "NVIDIA A100-PCIE-40GB", 39, 38, True, "device 3"),
+            (4, "NVIDIA H100 PCIe", 79, 74, True, "device 3"),
+            (4, "NVIDIA A100-SXM4-80GB", 79, 40, True, "device 3"),
+            (4, "NVIDIA A100-SXM4-80GB", 79, 74, False, "BF16"),
+        ]
+        for count, name, total, free, bf16, error in cases:
+            with self.subTest(count=count, name=name, free=free, bf16=bf16), TemporaryDirectory() as temp, ExitStack() as stack:
+                for suffix, value in (("is_available", True), ("device_count", count),
+                                      ("device", nullcontext()), ("is_bf16_supported", bf16)):
+                    stack.enter_context(patch("torch.cuda." + suffix, return_value=value))
+                stack.enter_context(patch("torch.cuda.get_device_name", side_effect=lambda i:
+                                          "NVIDIA A100-PCIE-80GB" if i != 3 else name))
+                mem = stack.enter_context(patch("torch.cuda.mem_get_info", side_effect=lambda i:
+                                                (74 * gib, 79 * gib) if i != 3 else (free * gib, total * gib)))
+                stack.enter_context(patch("shutil.disk_usage", return_value=SimpleNamespace(free=64*gib)))
+                if error:
+                    with self.assertRaisesRegex(ValueError, error):
+                        preflight("route-sft", Path(temp))
+                else:
+                    preflight("route-sft", Path(temp))
+                    self.assertEqual([item.args[0] for item in mem.call_args_list], [0, 1, 2, 3])
+
+    def test_stage1_four_card_contract_keeps_old_global_batch_and_updates(self):
+        cfg = read_json(ROOT / "configs" / "route_sft.json")
+        self.assertEqual((cfg["world_size"], cfg["micro_batch"]), (4, 1))
+        self.assertEqual((cfg["good_per_batch"], cfg["bad_per_batch"], cfg["batches_per_epoch"], cfg["epochs"]),
+                         (6, 2, 281, 2))
+
     def test_four_gpu_launcher_reuses_explicit_sft_path(self):
         with TemporaryDirectory() as temp:
             work = Path(temp) / "new work"

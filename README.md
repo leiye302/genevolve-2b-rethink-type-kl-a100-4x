@@ -5,7 +5,7 @@
 | 项目 | 本版设置 |
 |---|---|
 | 数据 | 1,686 Good＋562 Bad，其中 373 条自然 Bad、189 条合成 Bad；每批 6 Good＋2 Bad |
-| 训练量 | 281 个有序批次走两遍，共 562 次参数更新；单卡，micro-batch 1，全局 batch 8 |
+| 训练量 | 4×A100 80GB 数据并行；原 281 个批次走两遍，共 562 次更新。每个全局批次仍是 8 条，由四卡各处理 2 条（每卡 micro-batch 1），每批只更新一次 |
 | 优化 | BF16，语言参数训练、视觉塔冻结；AdamW，LR `2e-6`，betas `(0.9, 0.95)`，weight decay `0.01`，clip `1.0`，seed 0；56 步 warmup，随后 cosine，整个训练仅一个调度器 |
 | 监督 | reasoning 不算 CE；每条后缀按自身 token 数取均值。保留独立 marker BCE（0.1），只在 Good 动作边界额外加冻结 SFT-550 的 Tool／Answer／Other 正向 KL（0.1） |
 | 上下文 | 原生文本工具协议，最大 12,288 tokens，不静默截断；不加 `<action>` 外壳，不启用 reasoning KL |
@@ -13,7 +13,7 @@
 
 ### 1. 准备代码、起点和数据
 
-训练环境：Linux、Python 3.11、CUDA 12.8，依赖和上游提交均在仓库内固定。本配方在单卡大显存环境训练；完整状态比单份 HF 权重大，建议为阶段一输出准备至少 **58 GiB** 可用空间（不含环境、起点、数据、渲染器及图片缓存）。仓库名称里的 `a100-4x` 是沿用的项目名，四卡是**可选二阶段**的配置。
+训练环境：Linux、Python 3.11、CUDA 12.8，**同机四张 A100 80GB**。可见设备须恰好四张，每张至少 75 GiB 总显存、68 GiB 空闲并支持 BF16；不要把绘图服务放在训练中的卡上。阶段一输出另需至少 **58 GiB** 空闲磁盘（不含环境、起点、数据、渲染器及图片缓存）。历史的 562 步实验是单卡；此处移植为四卡，保留全局样本与损失权重，不保证浮点计算逐位相同。
 
 ```bash
 git clone https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x.git
@@ -22,6 +22,7 @@ bash scripts/setup.sh
 source .venv/bin/activate
 export WORK="$PWD/work-281x2"
 export PARENT=/path/to/GenEvolve-2B-SFT/checkpoint-550
+export CUDA_VISIBLE_DEVICES=0,1,2,3  # 换成实际分配给这次训练的四张 A100
 python run.py --work "$WORK" prepare-route
 python run.py --work "$WORK" check-route --parent "$PARENT"
 ```
@@ -31,19 +32,28 @@ python run.py --work "$WORK" check-route --parent "$PARENT"
 
 ### 2. 只做一阶段
 
+可选：在正式训练前，运行四进程 CPU 梯度对照，或在目标机器上做一次四卡真实更新验收。前者不需要 GPU、权重或密钥；它不是四张 A100 的验收报告。后者需要同一 SFT-550 和已核验的样本包，只做内存中的一次更新，不启动评测、不覆盖训练产物。
+
+```bash
+python -m unittest discover -s tests -p test_four_rank_route.py -v
+torchrun --standalone --nproc-per-node=4 scripts/check_route_four_gpu.py --parent "$PARENT" --data "$WORK/route_data/route-sft-reviewed-v4-public"
+```
+
+正式训练：
+
 ```bash
 python run.py --work "$WORK" route-sft --parent "$PARENT"
 ```
 
-仅训练**不需要**搜索、Judge 或 hint 密钥。保存路径分别为 `$WORK/route_sft/checkpoint-00281`、`checkpoint-00562`（续训状态）和 `hf-step-00562`（最终 HF 导出）。如在首轮结束后中断，重跑同一条命令、使用同一起点/数据/工作目录，可从已保存断点恢复；不要指定旧单轮实验的输出作为 `PARENT`。
+仅训练**不需要**搜索、Judge 或 hint 密钥。不用手工再套一层 `torchrun`，此入口会启动四个训练进程。保存路径分别为 `$WORK/route_sft/checkpoint-00281`、`checkpoint-00562`（续训状态）和 `hf-step-00562`（最终 HF 导出）。如在首轮结束后中断，用同一配置、同一四卡拓扑和工作目录重跑即可从断点恢复；不要把历史单卡的续训状态导入新的四卡 WORK，也不要以旧 281 步输出充当 `PARENT`。
 
 ### 3. 末轮评测
 
-**只有一张卡时，先完成上面训练，再启动绘图器**，这样绘图器不会在 SFT 期间占用显存。另一个终端运行：
+等四个 SFT 进程完全退出后再启动绘图器。评测本身保持一张卡运行 Actor；下例假设分配到的设备是 0–3，将 GPU 1 给绘图器、GPU 0 给 Actor（实际编号不同时请一起替换）。另一个终端运行：
 
 ```bash
 bash scripts/setup.sh --renderer
-bash scripts/serve_renderer.sh --cpu-offload
+CUDA_VISIBLE_DEVICES=1 bash scripts/serve_renderer.sh --cpu-offload
 ```
 
 在训练环境中设置搜索和 Judge 凭据（见 [配置模板](configs/services.env.example)），并确认绘图服务可达：
@@ -54,7 +64,7 @@ read -rsp 'Serper key: ' SERPER_API_KEY; echo; export SERPER_API_KEY
 read -rsp 'Judge key: ' JUDGE_API_KEY; echo; export JUDGE_API_KEY
 # 若服务商不同，设置自己的 JUDGE_BASE_URL；须能提供锁定的 Judge 模型。
 python run.py --work "$WORK" prepare
-python run.py --work "$WORK" eval --split bench --policy "$WORK/route_sft/hf-step-00562"
+CUDA_VISIBLE_DEVICES=0 python run.py --work "$WORK" eval --split bench --policy "$WORK/route_sft/hf-step-00562"
 ```
 
 如已有**独立绘图服务**，可直接 `python run.py --work "$WORK" route-sft --parent "$PARENT" --eval`，只在最终导出后测一次。评测使用 Actor temperature 0.6、top-p 0.9、逐题 seed=42+序号；渲染器 Qwen-Image-Edit-2511，Judge `qwen3.7-flash-2026-07-15`，关闭 thinking。服务不可用时不要换 Judge 后仍宣称属于同一对照。真实在线检索、图片下载与服务端评分会波动；固定题目不代表逐次生成相同图片。
@@ -63,7 +73,7 @@ python run.py --work "$WORK" eval --split bench --policy "$WORK/route_sft/hf-ste
 
 ### 4. 可选：接原有四卡二阶段
 
-在相同工作目录准备官方数据，按[服务模板](configs/services.env.example)配置搜索、评分、绘图和局部 hint 服务，然后：
+在相同工作目录准备官方数据，按[服务模板](configs/services.env.example)配置搜索、评分、绘图和局部 hint 服务。四卡二阶段要用满所有四张卡；若阶段一评测时将绘图器放在 GPU 1，请先退出该实例，将绘图服务放到单独的 GPU 或机器，再启动二阶段：
 
 ```bash
 python run.py --work "$WORK" prepare

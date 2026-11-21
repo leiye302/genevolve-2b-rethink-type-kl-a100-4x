@@ -14,6 +14,7 @@ from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType,
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .common import WORLD_SIZE, read_json, write_json
 from .policy import ActorScorer
@@ -67,12 +68,34 @@ def make_sharded_actor(path, device, saved=None, scorer_type=ActorScorer, *, cpu
     )
 
 
+def make_ddp_route_actor(path, device, saved, scorer_type):
+    """One replica per A100. Keep trainable parameters and AdamW moments in FP32."""
+    policy = load_model(path, torch.float32, attention="sdpa")
+    policy.model.visual.requires_grad_(False)
+    policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    scorer = scorer_type(policy)
+    if saved is not None:
+        scorer.load_state_dict(saved, strict=True)
+    scorer.to(device)
+    # Set FA2 after moving to this rank's GPU. Autocast in update_ddp produces
+    # BF16 attention activations without reducing master/AdamW state precision.
+    policy.set_attn_implementation("flash_attention_2")
+    if policy.config.text_config._attn_implementation != "flash_attention_2":
+        raise RuntimeError("The Qwen text decoder did not activate FlashAttention 2.")
+    if any(p.dtype != torch.float32 for p in scorer.parameters() if p.requires_grad):
+        raise RuntimeError("DDP Route-SFT requires FP32 trainable master weights.")
+    return DDP(scorer, device_ids=[device.index], output_device=device.index,
+               broadcast_buffers=False, find_unused_parameters=False, gradient_as_bucket_view=True)
+
+
 @torch.no_grad()
 def copy_actor(sharded, target, rank0_only=False):
     # Generation uses a local BF16 replica so decoding does not all-gather
     # parameters for each token. The replica is refreshed before each batch.
     if not isinstance(sharded, FSDP):
-        target.load_state_dict(sharded.model.state_dict())
+        if not rank0_only or not dist.is_initialized() or dist.get_rank() == 0:
+            source = sharded.module if isinstance(sharded, DDP) else sharded
+            target.load_state_dict(source.model.state_dict())
         return
     # CPU parameters need no offload; Torch also rejects summon_full_params
     # offload for NO_SHARD (including a single CUDA rank). Copies into a CPU
@@ -172,9 +195,16 @@ def restore_rng(value, device):
 
 def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, device, keep=2, verify=False, *, memory=None):
     states = gather(get_rng(device))
-    with full_state(actor):
-        model = actor.state_dict()
-        optimizer_state = FSDP.optim_state_dict(actor, optimizer) if isinstance(actor, FSDP) else optimizer.state_dict()
+    if isinstance(actor, DDP):
+        # All replicas are already synchronized. Use unwrapped names on disk;
+        # the complete AdamW state is needed once, not four times.
+        if rank == 0:
+            model = actor.module.state_dict()
+            optimizer_state = optimizer.state_dict()
+    else:
+        with full_state(actor):
+            model = actor.state_dict()
+            optimizer_state = FSDP.optim_state_dict(actor, optimizer) if isinstance(actor, FSDP) else optimizer.state_dict()
     if rank == 0:
         folder.mkdir(parents=True, exist_ok=True)
         target = folder / f"checkpoint-{step:05d}"

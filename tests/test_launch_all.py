@@ -93,6 +93,14 @@ class LaunchAllTest(unittest.TestCase):
         self.sequence.hardware.assert_not_called()
         self.sequence.launch.assert_not_called()
 
+    def test_route_only_rejects_nonmatching_parent_before_download_or_gpu(self):
+        self.sequence.parent.side_effect = ValueError("wrong SFT-550 bytes")
+        with self.assertRaisesRegex(ValueError, "wrong SFT-550"):
+            run.execute(Namespace(command="route-sft", parent=self.parent, data=None, eval=True), self.work)
+        self.sequence.public_pack.assert_not_called()
+        self.sequence.hardware.assert_not_called()
+        self.sequence.launch.assert_not_called()
+
     def test_stage1_exit_failure_never_starts_stage2(self):
         self.sequence.launch.side_effect = CalledProcessError(1, "fixture")
         with self.assertRaises(CalledProcessError):

@@ -2,7 +2,7 @@
   "schema": "genevolve-route-sft-6g2b-v4-finish-reviewed",
   "manifest_sha256": "71b20aa7d45de7af3e7aa9f73f3bdceca57c9c3cf53944c0b2eb61f0b72b7c05",
   "parent_step": 550,
-  "world_size": 1,
+  "world_size": 4,
   "micro_batch": 1,
   "good_per_batch": 6,
   "bad_per_batch": 2,

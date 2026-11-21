@@ -347,6 +347,20 @@ class RethinkTest(unittest.TestCase):
             write_json(path / "completed.json", {"step": 562, "algorithm": "route-sft", "contract": identity})
             write_json(path / "export_sha256.json", sft_manifest(path))
             self.assertEqual(verify_route_export(path, expected_contract=identity)["completed"]["step"], 562)
+            # A completed single-card model is still a valid stage-two input.
+            # A new four-card run must never resume that old training directory.
+            historical = {**identity, "config": {**cfg, "world_size": 1}}
+            four_card = {**cfg, "world_size": 4}
+            write_json(path / "completed.json", {"step": 562, "algorithm": "route-sft", "contract": historical})
+            self.assertEqual(verify_route_export(path, cfg=four_card)["completed"]["step"], 562)
+            with self.assertRaisesRegex(ValueError, "supplied 2B parent"):
+                verify_route_export(path, cfg=four_card, expected_contract={**identity, "config": four_card})
+            for mismatch in ({"world_size": 2}, {"world_size": True}, {"good_type_kl_lambda": 0.2}):
+                wrong = {**historical, "config": {**historical["config"], **mismatch}}
+                write_json(path / "completed.json", {"step": 562, "algorithm": "route-sft", "contract": wrong})
+                with self.assertRaisesRegex(ValueError, "configured"):
+                    verify_route_export(path, cfg=four_card)
+            write_json(path / "completed.json", {"step": 562, "algorithm": "route-sft", "contract": identity})
             (parent / "model.safetensors").write_bytes(b"a different step 550 export")
             with self.assertRaisesRegex(ValueError, "supplied 2B parent"):
                 verify_route_export(path, expected_contract={**identity, "parent": sft_manifest(parent)})

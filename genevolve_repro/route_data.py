@@ -18,6 +18,21 @@ def recipe():
     return read_json(ROOT / "configs" / "route_sft.json")
 
 
+def compatible_export_config(actual, expected):
+    """A finished HF policy is portable; a resume checkpoint is not.
+
+    Only the number of data-parallel workers may differ between the historical
+    single-card run and its four-card counterpart. Do not use this comparison
+    for partial checkpoints, mutable optimizer states or the training work dir.
+    """
+    if not isinstance(actual, dict) or not isinstance(expected, dict):
+        return False
+    for cfg in (actual, expected):
+        if type(cfg.get("world_size")) is not int or cfg["world_size"] not in (1, 4):
+            return False
+    return {**actual, "world_size": expected["world_size"]} == expected
+
+
 def require(condition, message):
     if not condition:
         raise ValueError(message)

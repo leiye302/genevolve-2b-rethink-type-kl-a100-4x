@@ -1,4 +1,4 @@
-"""The production Route-SFT profile is one rank; compare its accumulated update to the direct objective."""
+"""The historical single-worker objective remains a reference for the four-GPU port."""
 from copy import deepcopy
 import unittest
 
@@ -14,8 +14,8 @@ class SingleGpuObjectiveTest(unittest.TestCase):
     def test_accumulated_update_matches_full_vocabulary_reference(self):
         torch.set_num_threads(1)
         torch.manual_seed(12)
-        cfg = recipe()
-        self.assertEqual((cfg["world_size"],cfg["epochs"],cfg["batches_per_epoch"]), (1,2,281))
+        cfg = {**recipe(), "world_size": 1}
+        self.assertEqual((cfg["epochs"],cfg["batches_per_epoch"]), (2,281))
         model=ToyPolicy()
         gold=deepcopy(model)
         actor=RouteScorer(model,projection_chunk=2,type_ids=(2,3,4))

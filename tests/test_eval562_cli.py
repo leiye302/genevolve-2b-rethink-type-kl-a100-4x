@@ -18,9 +18,9 @@ class TableContract(unittest.TestCase):
             internal = parser.parse_args(run.evaluation_arguments(args))
             self.assertEqual(internal.max_cases, expected)
 
-    def test_only_stage_two_uses_four_workers(self):
+    def test_both_training_stages_use_four_workers_but_evaluation_keeps_one(self):
         with patch.object(run.subprocess, "run") as command:
-            for stage, workers in [("_route-sft", 1), ("_eval", 1), ("_rethink", 4), ("_grpo", 4)]:
+            for stage, workers in [("_route-sft", 4), ("_eval", 1), ("_rethink", 4), ("_grpo", 4)]:
                 run.distributed(stage, Path("work"))
                 self.assertIn(f"--nproc-per-node={workers}", command.call_args.args[0])
 

@@ -111,18 +111,21 @@ def _validate(entries, rows, wanted, complete=False):
 def prepare_reference_cache(out,parent,rows,contract,rank,size,device,*,loader=None,
                             attention="flash_attention_2",flush_every=16,type_ids=TYPE_IDS):
     """Score frozen parent once, unload before training. Returns only 3 floats/Good."""
-    if rank!=0 or size!=1 or flush_every<1:
-        raise ValueError("The verified SFT cache is single-rank and requires positive flush_every.")
+    if size not in (1,4) or not 0 <= rank < size or flush_every<1:
+        raise ValueError("Use one or four ranks and a positive cache flush interval.")
     if not contract or not isinstance(contract,dict):
         raise ValueError("Missing bound parent/data/config contract.")
     device=torch.device(device)
     config={"version":THREEWAY_VERSION, "contract":contract, "dtype":"bfloat16",
             "attention":attention,"type_ids":list(type_ids),"projection":"full-native-vocabulary"}
+    if size != 1:
+        config["shard"] = {"rank":rank, "world_size":size, "partition":"row_index_mod_world_size"}
     folder=Path(out)/"good_threeway_reference"
     folder.mkdir(parents=True,exist_ok=True)
-    f=folder/"rank-0.json"
-    receipt=folder/"rank-0.sha256.json"
-    expected={str(j) for j,r in enumerate(rows) if r["route_label"]==0}
+    f=folder/f"rank-{rank}.json"
+    receipt=folder/f"rank-{rank}.sha256.json"
+    all_good={str(j) for j,r in enumerate(rows) if r["route_label"]==0}
+    expected={j for j in all_good if int(j) % size == rank}
     saved=_read(f) if f.is_file() else {"identity":config,"entries":{}}
     if saved.get("identity")!=config:
         raise ValueError("Three-way cache is for a different model/data/config.")
@@ -158,4 +161,17 @@ def prepare_reference_cache(out,parent,rows,contract,rank,size,device,*,loader=N
         _write(f,saved)
     if not sealed:
         _write(receipt,{f.name:_file_sha(f)})
-    return {int(k):v["logp"] for k,v in entries.items()}
+    result={int(k):v["logp"] for k,v in entries.items()}
+    if size == 1:
+        return result
+    import torch.distributed as dist
+    if not dist.is_initialized() or (rank,size)!=(dist.get_rank(),dist.get_world_size()):
+        raise ValueError("Reference shards require a matching process group.")
+    parts=[None]*size
+    dist.all_gather_object(parts,result)
+    merged={}
+    for owner,part in enumerate(parts):
+        if set(part)!={int(j) for j in all_good if int(j)%size==owner}:
+            raise ValueError("Missing, duplicated or misassigned frozen Good reference rows.")
+        merged.update(part)
+    return merged

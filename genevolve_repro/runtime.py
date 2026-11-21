@@ -9,12 +9,20 @@ def preflight(stage, work):
     import torch
 
     if stage == "route-sft":
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
-            raise ValueError("Route-SFT requires one visible CUDA GPU.")
-        with torch.cuda.device(0):
-            free, total = torch.cuda.mem_get_info()
-            if not torch.cuda.is_bf16_supported() or total < 29 * 2**30 or free < min(total * .85, 58 * 2**30):
-                raise ValueError("Route-SFT requires an available BF16 GPU with >=29 GiB; see the hardware recipe.")
+        from .route_data import recipe
+        size = recipe()["world_size"]
+        if size != 4 or not torch.cuda.is_available() or torch.cuda.device_count() != size:
+            raise ValueError("Route-SFT requires exactly four visible A100 80GB GPUs; use CUDA_VISIBLE_DEVICES.")
+        for i in range(size):
+            with torch.cuda.device(i):
+                name = torch.cuda.get_device_name(i)
+                free, total = torch.cuda.mem_get_info(i)
+                if "A100" not in name.upper() or total < 75 * 2**30 or not torch.cuda.is_bf16_supported():
+                    raise ValueError(f"Route-SFT requires four BF16 A100 80GB GPUs; visible device {i}: "
+                                     f"{name}, {total / 2**30:.1f} GiB.")
+                if free < 68 * 2**30:
+                    raise ValueError(f"Route-SFT needs >=68 GiB free on each A100; visible device {i} "
+                                     f"has {free / 2**30:.1f} GiB. Stop the renderer or move it to another GPU.")
         folder = work / "route_sft"
         need = (9 if (folder / "checkpoint-00562" / "state_sha256.json").is_file() else
                 35 if (folder / "checkpoint-00281" / "state_sha256.json").is_file() else 58)

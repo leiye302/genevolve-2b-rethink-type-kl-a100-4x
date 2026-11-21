@@ -9,9 +9,15 @@ from genevolve_repro.sft_export import export_files, file_sha256, sft_manifest
 
 
 def distributed(subcommand, work, *arguments):
-    # Stage one and its matched evaluation use the first visible GPU. Stage
-    # two continues to see all four assigned GPUs and uses its original ranks.
-    workers = 1 if subcommand in {"_route-sft", "_eval"} else WORLD_SIZE
+    # RL keeps its native four ranks. Evaluation retains one Actor process so
+    # the fixed-eight rollout order and per-case seed stream do not change.
+    if subcommand == "_route-sft":
+        from genevolve_repro.route_data import recipe
+        workers = recipe()["world_size"]
+        if workers != 4:
+            raise ValueError("The published Route-SFT launcher requires four A100 80GB GPUs.")
+    else:
+        workers = 1 if subcommand == "_eval" else WORLD_SIZE
     subprocess.run([
         sys.executable, "-m", "torch.distributed.run", "--standalone", "--nnodes=1",
         f"--nproc-per-node={workers}", str(ROOT / "run.py"),
@@ -148,12 +154,14 @@ def execute(args, work):
         from genevolve_repro.data import prepare_embedding
         prepare_embedding(work)
     if args.command == "route-sft":
-        from genevolve_repro.route_data import pack_manifest, recipe
+        from genevolve_repro.route_data import pack_manifest, recipe, verify_parent
         from genevolve_repro.route_sft import verify_route_export
         from genevolve_repro.runtime import preflight
 
-        data = route_data_folder(work, args.data)
         cfg = recipe()
+        parent = args.parent.resolve()
+        verify_parent(parent, cfg)
+        data = route_data_folder(work, args.data)
         pack_manifest(data, cfg)
         evaluate_final = getattr(args, "eval", False)
         if evaluate_final:
@@ -166,7 +174,7 @@ def execute(args, work):
             except (ValueError, FileNotFoundError):
                 prepare(work)
         preflight("route-sft", work)
-        distributed("_route-sft", work, "--parent", str(args.parent.resolve()), "--data", str(data))
+        distributed("_route-sft", work, "--parent", str(parent), "--data", str(data))
         if evaluate_final:
             export = final_route_export(work, cfg)
             verify_route_export(export)
@@ -199,7 +207,7 @@ def route_flags(parser, *, internal=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenEvolve 2B: one-GPU two-epoch Route-SFT, four-GPU native SDL")
+    parser = argparse.ArgumentParser(description="GenEvolve 2B: four-A100 two-epoch Route-SFT, native four-GPU SDL")
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")

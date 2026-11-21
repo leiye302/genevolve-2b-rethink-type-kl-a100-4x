@@ -14,6 +14,8 @@ $$
 
 Here \(G\) contains all six Good rows in a fixed batch. BCE uses the **entire vocabulary**: marker logit minus log-sum-exp of all non-marker logits. Suffix CE is averaged separately per row before averaging rows. The marker on Bad is therefore both a suffix target and an independent boundary decision. There is no extra type BCE, opener reweighting, or reasoning-token KL.
 
+The four A100s process **one common eight-row batch per update**, not eight rows per device. Each replica processes two rows sequentially (micro-batch 1). If rank \(r\) owns \(B_r\), the global loss is the sum of the four local contributions with the same fixed denominators 8 (CE/BCE) and 6 (Good KL). Since DDP averages gradients across four ranks, each local contribution is multiplied by four before backpropagation. Do not divide KL by the rank's local Good count or enlarge the global batch. The original single-device run and this distributed recipe target the same objective, not bitwise-identical arithmetic.
+
 ### Three disjoint events, not a two-class softmax
 
 For both the frozen parent and the student define
