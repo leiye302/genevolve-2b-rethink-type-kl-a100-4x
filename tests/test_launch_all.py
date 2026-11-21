@@ -1,153 +1,128 @@
+"""Exercise the public orchestrator without GPUs, checkpoints or paid services."""
 from argparse import Namespace
-from contextlib import ExitStack, redirect_stdout
-from io import StringIO
+from contextlib import ExitStack
 from pathlib import Path
-from subprocess import CalledProcessError
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import ANY, Mock, call, patch
+from unittest.mock import Mock, call, patch
 
 import run
 
 
-class LaunchAllTest(unittest.TestCase):
+class ThreeStages(unittest.TestCase):
     def setUp(self):
-        directory = self.enterContext(TemporaryDirectory())
-        root = Path(directory).resolve()
-        self.work = root / "work"
-        self.parent = root / "checkpoint-550"
-        self.pack = root / "route-sft-v4"
-        self.final = self.work / "route_sft" / "hf-step-00562"
-        self.args = Namespace(command="all", parent=self.parent, data=self.pack, steps=30, eval=False)
+        self.work = Path(self.enterContext(TemporaryDirectory())).resolve()
+        self.args = Namespace(command="all", parent=None, data=None, steps=40, eval=False)
+        self.native = self.work / "native_sft" / "checkpoint-550"
+        self.route = run.final_route_export(self.work)
+        self.pack = self.work / "route-data"
         stack = self.enterContext(ExitStack())
-        stack.enter_context(redirect_stdout(StringIO()))
-        self.sequence = Mock()
+        self.events = Mock()
         for name, target in {
-            "public_pack": "genevolve_repro.route_release.prepare_route",
-            "upstream": "run.load_upstream",
-            "services": "run.check_rethink_services",
-            "env": "run.required_env",
-            "export": "run.export_files",
-            "launch": "run.distributed",
-            "verify_data": "genevolve_repro.data.verify_data",
-            "prepare": "genevolve_repro.data.prepare",
+            "native": "genevolve_repro.native_sft.run_native",
+            "pack": "genevolve_repro.route_release.prepare_route",
+            "upstream": "run.load_upstream", "services": "run.check_rethink_services",
+            "env": "run.required_env", "hf": "run.export_files", "launch": "run.distributed",
+            "verify_data": "genevolve_repro.data.verify_data", "prepare": "genevolve_repro.data.prepare",
             "prepare_embedding": "genevolve_repro.data.prepare_embedding",
             "embedding_ready": "genevolve_repro.data.embedding_ready",
             "manifest": "genevolve_repro.route_data.pack_manifest",
             "parent": "genevolve_repro.route_data.verify_parent",
             "identity": "genevolve_repro.route_data.route_identity",
             "hardware": "genevolve_repro.runtime.preflight",
-            "handoff": "genevolve_repro.route_sft.verify_route_export",
+            "space": "genevolve_repro.runtime.check_milestone_space",
+            "verified": "genevolve_repro.route_sft.verify_route_export",
+            "bench": "genevolve_repro.rl_milestones.run_bench_eval",
+            "schedule": "genevolve_repro.rl_milestones.run_schedule",
         }.items():
-            self.sequence.attach_mock(stack.enter_context(patch(target)), name)
-        self.sequence.embedding_ready.return_value = False
-        self.sequence.public_pack.return_value = self.pack
+            self.events.attach_mock(stack.enter_context(patch(target)), name)
+        self.events.native.return_value = self.native
+        self.events.pack.return_value = self.pack
+        self.events.embedding_ready.return_value = False
+        self.events.bench.side_effect = lambda work,policy,count,fn: fn(policy,count)
+        # Drive the exact public callback interface. The independent milestone tests
+        # additionally exercise scoring contracts, partial results and real RNG restoration.
+        def schedule(work, identity, train, evaluate):
+            self.assertIs(identity, self.events.verified.return_value)
+            for n in (10,20,30,40):
+                train(n)
+                policy = work / "rethink" / ("final" if n == 40 else f"hf-step-{n:05d}")
+                evaluate(policy, 8)
+            evaluate(policy, None)
+        self.events.schedule.side_effect = schedule
 
-    def test_download_then_route_sft_then_verify_then_stage2_then_eval(self):
-        self.sequence.verify_data.side_effect = FileNotFoundError()
-        self.args.eval = True
+    def evalcall(self, policy, n=8):
+        return call("_eval", self.work, "--split", "bench", "--policy", str(policy),
+                    *(("--max-cases", str(n)) if n is not None else ("--full-benchmark",)))
+
+    def test_default_three_stages_dense_schedule_no_midpoint_or_extra_full_sft_eval(self):
+        self.events.verify_data.side_effect = FileNotFoundError()
         run.execute(self.args, self.work)
-        self.sequence.assert_has_calls([
-            call.verify_data(self.work), call.prepare(self.work),
-            call.launch("_route-sft", self.work, "--parent", str(self.parent), "--data", str(self.pack)),
-        ])
-        self.sequence.assert_has_calls([
-            call.handoff(self.final, expected_contract=self.sequence.identity.return_value),
-            call.embedding_ready(self.work), call.prepare_embedding(self.work),
-            call.hardware("rethink", self.work),
-            call.launch("_rethink", self.work, "--sft-checkpoint", str(self.final), "--steps", "30"),
-        ])
-        self.assertEqual(self.sequence.launch.call_args_list[-1],
-                         call("_eval", self.work, "--split", "bench", "--policy",
-                              str(self.work / "rethink" / "final"), "--max-cases", "8"))
+        self.events.prepare.assert_called_once_with(self.work)
+        self.events.native.assert_called_once_with(self.work)
+        self.events.parent.assert_called_once()
+        self.events.prepare_embedding.assert_called_once()
+        expected = [self.evalcall(self.native),
+                    call("_route-sft", self.work, "--parent", str(self.native), "--data", str(self.pack)),
+                    self.evalcall(self.route)]
+        for n in (10, 20, 30, 40):
+            expected += [call("_rethink", self.work, "--sft-checkpoint", str(self.route),
+                              "--steps", "40", "--stop-after", str(n)),
+                         self.evalcall(self.work / "rethink" / ("final" if n == 40 else f"hf-step-{n:05d}"))]
+        expected += [self.evalcall(self.work / "rethink" / "final", None)]
+        self.assertEqual(self.events.launch.call_args_list, expected)
+        self.events.verified.assert_called_once_with(self.route, expected_contract=self.events.identity.return_value)
 
-    def test_resume_reuses_ready_stage1_and_pinned_data(self):
-        self.final.mkdir(parents=True)
-        for name in ("completed.json", "export_sha256.json"):
-            (self.final / name).touch()
-        self.sequence.embedding_ready.return_value = True
+    def test_explicit_existing_parent_and_verified_route_skip_training_but_not_eval_gates(self):
+        self.args.parent = self.native
+        self.route.mkdir(parents=True)
+        for f in ("completed.json","export_sha256.json"):
+            (self.route / f).touch()
         run.execute(self.args, self.work)
-        self.sequence.prepare.assert_not_called()
-        self.sequence.prepare_embedding.assert_not_called()
-        self.sequence.handoff.assert_called_once_with(
-            self.final, expected_contract=self.sequence.identity.return_value,
-        )
-        self.sequence.launch.assert_called_once_with(
-            "_rethink", self.work, "--sft-checkpoint", str(self.final), "--steps", "30",
-        )
-        self.sequence.public_pack.assert_not_called()
+        self.events.native.assert_not_called()
+        self.assertNotIn("_route-sft", [c.args[0] for c in self.events.launch.call_args_list])
+        self.assertEqual([c.args[1:3] for c in self.events.bench.call_args_list], [(self.native,8),(self.route,8)])
+        self.events.parent.assert_called_once()
 
-    def test_all_uses_public_pack_when_no_override_is_given(self):
-        self.args.data = None
-        run.execute(self.args, self.work)
-        self.sequence.public_pack.assert_called_once_with(self.work)
-        self.sequence.manifest.assert_called_once_with(self.pack, ANY)
-        self.sequence.launch.assert_any_call("_route-sft", self.work, "--parent", str(self.parent),
-                                             "--data", str(self.pack))
+    def test_no_unverified_parent_or_wrong_route_is_evaluated(self):
+        self.events.parent.side_effect = ValueError("wrong parent")
+        with self.assertRaisesRegex(ValueError,"wrong parent"):
+            run.execute(self.args,self.work)
+        self.events.bench.assert_not_called()
+        self.events.parent.side_effect = None
+        self.events.verified.side_effect = ValueError("wrong Route export")
+        with self.assertRaisesRegex(ValueError,"wrong Route export"):
+            run.execute(self.args,self.work)
+        self.assertEqual(self.events.bench.call_args_list[-1].args[1], self.native)
+        self.events.schedule.assert_not_called()
 
-    def test_pack_failure_stops_before_training(self):
-        self.args.data = None
-        self.sequence.public_pack.side_effect = ValueError("dataset checksum mismatch")
-        with self.assertRaisesRegex(ValueError, "dataset checksum mismatch"):
-            run.execute(self.args, self.work)
-        self.sequence.hardware.assert_not_called()
-        self.sequence.launch.assert_not_called()
+    def test_eval_error_stops_before_next_training(self):
+        self.events.bench.side_effect = RuntimeError("judge offline")
+        with self.assertRaisesRegex(RuntimeError,"judge offline"):
+            run.execute(self.args,self.work)
+        self.events.schedule.assert_not_called()
+        self.events.launch.assert_not_called()
 
-    def test_route_only_rejects_nonmatching_parent_before_download_or_gpu(self):
-        self.sequence.parent.side_effect = ValueError("wrong SFT-550 bytes")
-        with self.assertRaisesRegex(ValueError, "wrong SFT-550"):
-            run.execute(Namespace(command="route-sft", parent=self.parent, data=None, eval=True), self.work)
-        self.sequence.public_pack.assert_not_called()
-        self.sequence.hardware.assert_not_called()
-        self.sequence.launch.assert_not_called()
+    def test_invalid_horizon_rejected_before_external_calls(self):
+        self.args.steps = 322
+        with self.assertRaisesRegex(ValueError,"40"):
+            run.execute(self.args,self.work)
+        self.events.services.assert_not_called()
+        self.events.native.assert_not_called()
 
-    def test_stage1_exit_failure_never_starts_stage2(self):
-        self.sequence.launch.side_effect = CalledProcessError(1, "fixture")
-        with self.assertRaises(CalledProcessError):
-            run.execute(self.args, self.work)
-        self.sequence.launch.assert_called_once()
-        self.sequence.handoff.assert_not_called()
-        self.sequence.prepare_embedding.assert_not_called()
+    def test_route_sft_alone_needs_no_services_and_evals_only_if_requested(self):
+        args = Namespace(command="route-sft", parent=self.native, data=self.pack, eval=False)
+        train_call = call("_route-sft", self.work, "--parent", str(self.native), "--data", str(self.pack))
+        run.execute(args,self.work)
+        self.assertEqual(self.events.launch.call_args_list, [train_call])
+        self.events.services.assert_not_called()
+        self.events.env.assert_not_called()
+        args.eval = True
+        self.events.launch.reset_mock()
+        run.execute(args,self.work)
+        self.assertEqual(self.events.launch.call_args_list, [train_call, self.evalcall(self.route)])
+        self.events.verified.assert_called_once_with(self.route)
 
-    def test_route_only_eval_is_called_once_after_final_verified_and_not_at_281(self):
-        args = Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=True)
-        run.execute(args, self.work)
-        self.assertEqual(self.sequence.launch.call_args_list, [
-            call("_route-sft", self.work, "--parent", str(self.parent), "--data", str(self.pack)),
-            call("_eval", self.work, "--split", "bench", "--policy", str(self.final), "--max-cases", "8"),
-        ])
-        self.sequence.handoff.assert_called_once_with(self.final)
-        self.sequence.services.assert_not_called()
 
-    def test_route_only_plain_command_never_evaluates_or_needs_services(self):
-        run.execute(Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=False), self.work)
-        self.sequence.launch.assert_called_once_with("_route-sft", self.work, "--parent", str(self.parent),
-                                                   "--data", str(self.pack))
-        self.sequence.env.assert_not_called()
-        self.sequence.prepare.assert_not_called()
-
-    def test_failed_final_handoff_never_pays_for_evaluation(self):
-        self.sequence.handoff.side_effect = ValueError("invalid export")
-        with self.assertRaisesRegex(ValueError, "invalid export"):
-            run.execute(Namespace(command="route-sft", parent=self.parent, data=self.pack, eval=True), self.work)
-        self.assertEqual([x.args[0] for x in self.sequence.launch.call_args_list], ["_route-sft"])
-
-    def test_bad_route_export_blocks_stage2(self):
-        self.sequence.handoff.side_effect = ValueError("fixture export mismatch")
-        with self.assertRaisesRegex(ValueError, "fixture export mismatch"):
-            run.execute(self.args, self.work)
-        self.assertEqual([record.args[0] for record in self.sequence.launch.call_args_list], ["_route-sft"])
-
-    def test_invalid_steps_fail_before_any_stage(self):
-        self.args.steps = 0
-        with self.assertRaisesRegex(ValueError, "must be positive"):
-            run.execute(self.args, self.work)
-        self.sequence.verify_data.assert_not_called()
-        self.sequence.launch.assert_not_called()
-
-    def test_wrong_parent_stops_before_downloading_data_or_launching(self):
-        self.sequence.parent.side_effect = ValueError("not a 2B SFT export")
-        with self.assertRaisesRegex(ValueError, "not a 2B SFT export"):
-            run.execute(self.args, self.work)
-        self.sequence.verify_data.assert_not_called()
-        self.sequence.launch.assert_not_called()
+if __name__ == "__main__":
+    unittest.main()

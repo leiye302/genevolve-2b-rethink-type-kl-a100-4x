@@ -1,4 +1,4 @@
-# What stage 1 optimizes
+# What Route-SFT optimizes (the second of the three training stages)
 
 Let \(s_i=(H_i,R_i)\) be the stored actor-visible history and original reasoning, up to the **native decision boundary**. Good keeps its sampled action; Bad inserts a single `<RETHINK>` marker before the corrected action. Let \(y_i\in\{0,1\}\) be the route label (1 = Bad), and \(Y_i\) the supervised suffix including EOS and, for Bad, the marker. History and reasoning are conditioning tokens, not CE targets.
 

@@ -236,12 +236,15 @@ def save_checkpoint(folder, actor, optimizer, scheduler, step, contract, rank, d
     barrier()
 
 
-def export_policy(folder, actor, replica, processor, step, rank, metadata=None):
+def export_policy(folder, actor, replica, processor, step, rank, metadata=None, *, seal=False):
     copy_actor(actor, replica, rank0_only=True)
     if rank == 0:
         temporary = Path(mkdtemp(prefix=".export-", dir=folder.parent))
         replica.save_pretrained(temporary, safe_serialization=True)
         processor.save_pretrained(temporary)
         write_json(temporary / "completed.json", {"step": step, **(metadata or {})})
+        if seal:
+            from .sft_export import sft_manifest
+            write_json(temporary / "export_sha256.json", sft_manifest(temporary))
         temporary.rename(folder)
     barrier()

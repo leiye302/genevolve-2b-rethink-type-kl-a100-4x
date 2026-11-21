@@ -24,6 +24,7 @@ from .policy import ActorScorer, make_agent, score_turn
 from .route_data import verify_parent
 from .route_sft import verify_route_export
 from .sft_export import file_sha256
+from .rl_milestones import STOPS, export_meta, policy_path, stop_step
 from . import teacher
 
 
@@ -121,7 +122,7 @@ def write_rollouts(folder, group, use_sdl=False):
     })
 
 
-def _loop(work, sft, rank, size, device, limit, *, rethink=False):
+def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=None):
     from transformers import AutoProcessor, AutoTokenizer
 
     load_upstream()
@@ -144,6 +145,7 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         raise RuntimeError("The pinned RL train split must contain 2,575 prompts.")
     random.Random(cfg["seed"]).shuffle(pool)
     total = limit if limit is not None else math.ceil(len(pool) / cfg["prompt_batch"])
+    stop = stop_step(total, stop_after, rethink)
     if total < 1:
         raise ValueError("At least one RL update is required.")
     out = work / ("rethink" if rethink else "grpo")
@@ -164,15 +166,19 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
                             name: file_sha256(ROOT / "configs" / name)
                             for name in ("local_hint_system.txt",)
                         })
+    if stop_after is not None:
+        contract["milestones"] = list(STOPS)  # stop_after is execution state, not part of the training recipe
     if (out / "contract.json").is_file() and read_json(out / "contract.json") != contract:
         raise RuntimeError("This work directory has a different RL, SFT, or training-data identity.")
     if rank == 0:
         write_json(out / "contract.json", contract)
-    if model_ready(final) and (final / "completed.json").is_file() and read_json(final / "completed.json")["step"] == total:
+    if stop_after is None and model_ready(final) and (final / "completed.json").is_file() and read_json(final / "completed.json")["step"] == total:
         if rank == 0:
             print(f"RL complete at {final}", flush=True)
         return
     checkpoint_path = latest(out)
+    if stop_after is not None and checkpoint_path is not None and not (checkpoint_path / "state_sha256.json").is_file():
+        raise ValueError("Milestone resume requires a verified complete state.")
     saved = load_checkpoint(checkpoint_path) if checkpoint_path else None
     if saved and saved["contract"] != contract:
         raise RuntimeError("Saved checkpoint configuration does not match this run.")
@@ -181,6 +187,14 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
             raise RuntimeError("Incomplete GenEvolve checkpoint: missing the experience bank.")
         memory = ExperienceBank(cfg["experience_capacity"], saved["memory"] if saved else None)
     start = saved["step"] if saved else 0
+    if stop_after is not None:
+        if (start not in (0, *STOPS) or start > stop or (saved and
+                (len(saved["rng"]) != size or saved["scheduler"]["T_max"] != total
+                 or saved["scheduler"]["last_epoch"] != start
+                 or checkpoint_path.name != f"checkpoint-{start:05d}"))):
+            raise ValueError("Unexpected resume state/step for the 40-update RL schedule.")
+        if stop != start and stop - start != 10:
+            raise ValueError("Run consecutive milestones; do not skip an evaluation boundary.")
     random.seed(cfg["seed"] + rank)
     torch.manual_seed(cfg["seed"] + rank)
     actor = make_sharded_actor(sft, device, saved["actor"] if saved else None)
@@ -197,16 +211,18 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
         teacher.verify_marker(tokenizer)
     replica = load_model(sft, torch.bfloat16).eval()
     reference = load_model(sft, torch.bfloat16).eval()
-    if rng:
-        restore_rng(rng, device)
     os.environ.setdefault("IMAGE_DOWNLOAD_DIR", str(work / "cache" / f"grpo-rank{rank}"))
     feedback = LiveFeedback(cfg, size)
     embedder = Embedder(work / "embedding") if rethink else None
     agent = make_agent(replica, tokenizer, device, cfg, track_actions=rethink)
     actor.train()
     local_batch = cfg["prompt_batch"] // size
+    # Only restore after constructing every stateful helper. Initializing a
+    # fresh tokenizer/model/embedder on resume must not consume rollout RNG.
+    if rng:
+        restore_rng(rng, device)
 
-    for step in range(start, total):
+    for step in range(start, stop):
         replica.to(device)
         copy_actor(actor, replica)
         scorer = ActorScorer(replica)
@@ -267,16 +283,24 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False):
                 row["rethink/trigger_fraction"] = row["rethink/generated_marker"] / max(1, row["rethink/turns"])
             write_json(out / "metrics" / f"step-{step + 1:05d}.json", row)
             print(row, flush=True)
-        if (step + 1) % cfg["save_every"] == 0 or step + 1 == total:
+        due = (step + 1) == stop if stop_after is not None else ((step + 1) % cfg["save_every"] == 0 or step + 1 == total)
+        if due:
             save_checkpoint(out, actor, optimizer, scheduler, step + 1, contract, rank, device,
-                            keep=cfg["keep_checkpoints"], memory=memory if rethink else None)
+                            keep=len(STOPS) if stop_after is not None else cfg["keep_checkpoints"],
+                            verify=stop_after is not None, memory=memory if rethink else None)
 
-    export_policy(final, actor, replica, processor, total, rank)
+    if stop_after is None:
+        export_policy(final, actor, replica, processor, total, rank)
+    else:
+        hf = policy_path(work, stop)
+        state = read_json(out / f"checkpoint-{stop:05d}" / "state_sha256.json")["training.pt"]
+        if not hf.exists():
+            export_policy(hf, actor, replica, processor, stop, rank, metadata=export_meta(contract, state), seal=True)
 
 
-def worker(work, sft, limit, *, rethink=False):
+def worker(work, sft, limit, *, rethink=False, stop_after=None):
     rank, size, device = initialize()
     try:
-        _loop(work, sft, rank, size, device, limit, rethink=rethink)
+        _loop(work, sft, rank, size, device, limit, rethink=rethink, stop_after=stop_after)
     finally:
         dist.destroy_process_group()

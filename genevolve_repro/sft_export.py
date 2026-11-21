@@ -47,6 +47,8 @@ def export_files(folder):
     if "tokenizer.json" not in files and not {"vocab.json", "merges.txt"} <= files:
         raise ValueError("The SFT export is missing its tokenizer vocabulary.")
     index = folder / "model.safetensors.index.json"
+    if (folder / "adapter_config.json").exists():
+        raise ValueError("Expected a standalone SFT model, not an adapter redirect.")
     if index.is_file():
         weight_map = read_json(index).get("weight_map")
         if not isinstance(weight_map, dict) or not weight_map:
@@ -63,6 +65,10 @@ def export_files(folder):
         path = folder / name
         if not path.is_file() or path.stat().st_size == 0:
             raise ValueError(f"The SFT export is missing a nonempty {name}.")
+    if index.is_file() and (folder / "model.safetensors").exists():
+        raise ValueError("Ambiguous HF export: both standalone and indexed model weights exist.")
+    if {p.name for p in folder.glob("*.safetensors")} != set(shards):
+        raise ValueError("Unexpected untracked safetensors in the SFT export.")
     return sorted(files)
 
 

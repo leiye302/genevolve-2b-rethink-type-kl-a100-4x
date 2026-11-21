@@ -5,6 +5,23 @@ import shutil
 from .common import WORLD_SIZE
 
 
+def check_milestone_space(work, policy):
+    """Estimate space for *remaining* training states/exports, excluding case images and caches."""
+    from .sft_export import export_files
+    # The Route export is BF16: FP32 actor plus two FP32 Adam moments <= 6 copies.
+    weight_bytes = sum((policy / f).stat().st_size for f in export_files(policy) if f.endswith(".safetensors"))
+    out = work / "rethink"
+    states = sum(not (out / f"checkpoint-{n:05d}" / "training.pt").is_file() for n in (10, 20, 30, 40))
+    exports = sum(not (out / name / "completed.json").is_file()
+                  for name in ("hf-step-00010", "hf-step-00020", "hf-step-00030", "final"))
+    available = shutil.disk_usage(work).free
+    needed = (6 * states + exports) * weight_bytes + 8 * 2**30
+    if available < needed:
+        raise ValueError(f"Remaining RL checkpoints/exports need an estimated {needed / 2**30:.1f} GiB "
+                         f"including a small reserve; only {available / 2**30:.1f} GiB free. "
+                         "Allow additional space for rollouts and evaluation images.")
+
+
 def preflight(stage, work):
     import torch
 

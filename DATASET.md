@@ -7,7 +7,7 @@ This is a derived GenEvolve training-decision dataset; it is **not** the officia
 | Good | 1,686 | Natural decisions, with the original sampled action |
 | Bad | 562 | 319 original natural errors + 54 natural resamples + 189 reviewed synthetic same-state contrasts |
 
-**The 8B model hash in the data manifest identifies the trajectory collector, not the training parent.** Training starts from the separately pinned **2B SFT-550**. Files from the old 297-batch v3 release, the natural-only 186-batch experiment, or the alternative recovery library are not interchangeable.
+**The 8B model hash in the data manifest identifies the trajectory collector, not the training parent.** Route-SFT starts from **2B native SFT-550**: either the historically pinned weights or a verified new native run from the pinned 2B base. Files from the old 297-batch v3 release, the natural-only 186-batch experiment, or the alternative recovery library are not interchangeable.
 
 ## Obtain the data
 

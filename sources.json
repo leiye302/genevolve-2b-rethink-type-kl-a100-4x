@@ -3,6 +3,10 @@
     "repo": "https://github.com/MeiGen-AI/GenEvolve.git",
     "revision": "23c847c559ccc0f95bbf4b3d8925898463822f4c"
   },
+  "sft_trainer": {
+    "repo": "https://github.com/hiyouga/LLaMA-Factory.git",
+    "revision": "7af909522a951e3ad9f022ea6f88b6755257eaa5"
+  },
   "comparison": {
     "repo": "https://github.com/leiye302/GenEvolve-2B-Reproduction.git",
     "revision": "57263f0583c633c3d515913b9935c3850cdf798e"

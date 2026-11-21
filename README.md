@@ -1,83 +1,57 @@
-# GenEvolve 2B · Route-SFT：旧 281 批库，两轮，Good 动作类型 KL
+# GenEvolve 2B · 从基模开始的三阶段 RETHINK 实验（4×A100 80GB）
 
-**默认起点是 GenEvolve 的 Qwen3-VL-2B-Instruct SFT checkpoint-550，不是裸基模，也不是已经训过一轮的 281 步模型。** 之后用同一份 2,248 条决策的库连续训练两个 epoch。**第 281 步只保存可续训状态；第 562 步保存可续训状态、导出 HF 模型，再评测固定 8 题。** 不重置优化器或学习率，不在中点启动生图服务或 Judge。
+默认入口 `all` 从公开的 **Qwen3-VL-2B-Instruct** 起跑，不需要事先拿到别人的 SFT-550。先训练 GenEvolve 自己的图文 SFT，再训练 RETHINK 的 Route-SFT，最后训练 40 步 RETHINK RL。这里的“从头”是从预训练基模开始后训练，不是随机初始化。
 
-| 项目 | 本版设置 |
-|---|---|
-| 数据 | 1,686 Good＋562 Bad，其中 373 条自然 Bad、189 条合成 Bad；每批 6 Good＋2 Bad |
-| 训练量 | 4×A100 80GB 数据并行；原 281 个批次走两遍，共 562 次更新。每个全局批次仍是 8 条，由四卡各处理 2 条（每卡 micro-batch 1），每批只更新一次 |
-| 优化 | BF16，语言参数训练、视觉塔冻结；AdamW，LR `2e-6`，betas `(0.9, 0.95)`，weight decay `0.01`，clip `1.0`，seed 0；56 步 warmup，随后 cosine，整个训练仅一个调度器 |
-| 监督 | reasoning 不算 CE；每条后缀按自身 token 数取均值。保留独立 marker BCE（0.1），只在 Good 动作边界额外加冻结 SFT-550 的 Tool／Answer／Other 正向 KL（0.1） |
-| 上下文 | 原生文本工具协议，最大 12,288 tokens，不静默截断；不加 `<action>` 外壳，不启用 reasoning KL |
-| 最终评测 | 锁定版本 GenEvolve-Bench 的第 0–7 题；不是整套 594 题，也不是随机抽取 8 题。缺图按 0 计入全 8 题均分；另报成功评分图数和自由生成 RETHINK 的回合／题目计数 |
+| 顺序 | 起点与训练 | 可续训断点 | GenEvolve-Bench 评测 |
+|---|---|---|---|
+| 1 · GenEvolve 原生 SFT | 2B 基模；8,800 条原生图文轨迹，四卡全局 batch 32，2 个 epoch = 550 步 | 275、550（ZeRO-3 状态） | **只在 550 步测固定 8 题** |
+| 2 · Route-SFT | 上一阶段 SFT-550；每批全局 6 Good＋2 Bad，共 281 批，连续两轮 = 562 步 | 281、562；562 另导出 HF 权重 | **只在 562 步测同一组 8 题** |
+| 3 · RETHINK RL | Route-SFT-562；GenEvolve GRPO＋原生 SDL，Actor 触发的局部 hint 仅给 Teacher。40 步为一个连续优化周期 | 10、20、30、40（含优化器、调度器、各卡 RNG 和经验库）；每处另留可评测权重 | **10、20、30、40 各测同一组 8 题**；第 40 步再单独跑 **全量 594 题** |
 
-### 1. 准备代码、起点和数据
+固定 8 题是[锁定的官方测试划分](configs/split_sha256.json)中 ID 0–7，顺序、Actor 温度 0.6、top-p 0.9、每题种子 42＋原下标均相同。它们供配对比较，不能当作全量成绩。两次 SFT 和四次 RL 子集评测，加上末轮 594 题，是 **6 份固定子集结果＋1 份全量结果**；不做 0 步或 SFT 中点的生图 benchmark。原生 SFT 自己的 200 条验证损失按原配方保留，与生图 benchmark 不同。评测不会更新经验库或参与反传。
 
-训练环境：Linux、Python 3.11、CUDA 12.8，**同机四张 A100 80GB**。可见设备须恰好四张，每张至少 75 GiB 总显存、68 GiB 空闲并支持 BF16；不要把绘图服务放在训练中的卡上。阶段一输出另需至少 **58 GiB** 空闲磁盘（不含环境、起点、数据、渲染器及图片缓存）。历史的 562 步实验是单卡；此处移植为四卡，保留全局样本与损失权重，不保证浮点计算逐位相同。
+### 一次启动
+
+需要同一台 Linux 机器上 **4 张可用 A100 80GB**（每张至少 68 GiB 空闲），Python 3.11、CUDA Toolkit 12.8、可访问公开模型与数据的网络，以及足够的服务器磁盘。全程同时保留原生 ZeRO 断点、Route 断点、4 份 RL 断点和导出，另有原生图片数据、生成图、日志与缓存；请勿按“只存最后一份权重”预留空间。训练所需的公开仓库、模型、数据、训练器均锁定版本，见 [sources.json](sources.json)。
 
 ```bash
 git clone https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x.git
 cd genevolve-2b-rethink-type-kl-a100-4x
 bash scripts/setup.sh
 source .venv/bin/activate
-export WORK="$PWD/work-281x2"
-export PARENT=/path/to/GenEvolve-2B-SFT/checkpoint-550
-export CUDA_VISIBLE_DEVICES=0,1,2,3  # 换成实际分配给这次训练的四张 A100
-python run.py --work "$WORK" prepare-route
+export CUDA_VISIBLE_DEVICES=0,1,2,3      # 换成分配给本实验的四张卡
+export WORK="$PWD/work"                  # 持久化服务器磁盘；后续续跑用同一绝对路径
+# 先在 shell 注入下述服务的环境变量。不要把密钥写入仓库或日志。
+python run.py --work "$WORK" all
+```
+
+- **搜索、评分与局部 hint：**按[服务模板](configs/services.env.example)设置 Serper、Qwen Judge（固定 `qwen3.7-flash-2026-07-15`，关闭 thinking）及支持 `glm-5.3-flash` 的 hint 接口。不要用不同 Judge 得到的分数冒充同一组结果。
+- **绘图是另一个服务，不是 Judge API。** `QWEN_SERVICE_URL` 须指向兼容的 Qwen-Image-Edit-2511 渲染端点，接受参考图并返回图片。RL 训练中也要绘图计算奖励，请将渲染放在独立服务或另外分配的 GPU；不要挤占这四张训练卡。自部署可在绘图机的同版本检出运行 `bash scripts/setup.sh --renderer`、`bash scripts/serve_renderer.sh --cpu-offload`；仅绑定/开放给授权调用方。完整流程会请求真实服务并产生费用；训练中断后重用同一 WORK。
+- **中断续跑：**重新运行同一条 `all`。阶段交接核对数据、父模型及导出身份；RL 每到一个里程点先落盘、释放训练进程再评测，通过后才继续下一段。各段始终使用 40 步总学习率计划，不是四个独立的 10 步实验。不要删除中间产物或把另一次运行混进这个 WORK。旧的 322 步 RL 工作目录不能当作本实验续跑。
+- **已有 SFT-550 可显式跳过原生训练：**`python run.py --work "$WORK" all --parent /path/to/checkpoint-550`。仍会评该模型的固定 8 题。接受有历史 SHA 锁的原始 2B SFT-550，或由本仓库原生配方训练并核验的 550；不接受裸基模、8B 权重或仅把目录命名为 550 的模型。显式外部起点不替你补做它的续训状态。不同设备或软件重新训练不会保证逐字节复现历史权重。
+
+若绘图服务在另一台获授权主机上并保持默认的本地监听，可从训练机建立 SSH 转发：
+`ssh -N -L 18001:127.0.0.1:8001 USER@RENDER_HOST`，并在训练进程设置
+`QWEN_SERVICE_URL=http://127.0.0.1:18001`。不需要把绘图服务开放到公网。
+hint 的 `GENEVOLVE_HINT_API_URL` 必须是完整 HTTPS `/chat/completions` 地址，不是只到 `/v1` 的基址。
+
+### 单独准备或运行
+
+```bash
+python run.py --work "$WORK" prepare-native       # 原生 SFT 基模与官方图文数据
+python run.py --work "$WORK" prepare-route        # 公开 281 批 Route 包
+python run.py --work "$WORK" native-sft --eval    # 只到原生 550，并评固定 8；纯训练可不加 --eval
+export PARENT="$WORK/native_sft/checkpoint-550"
 python run.py --work "$WORK" check-route --parent "$PARENT"
-```
-
-- **权重需由运行者提供**：使用与对照相同的完整 HF 导出，包含模型、tokenizer、processor 和 step 记录。可参考[原 2B SFT 工程（固定提交）](https://github.com/leiye302/GenEvolve-2B-Reproduction/tree/57263f0583c633c3d515913b9935c3850cdf798e)。架构相同或目录名叫 `checkpoint-550` 都不够：会核对原实验的模型和 tokenizer 哈希。这里不发布权重，也不以随机或裸基模兜底。
-- **训练样本独立提供**：[下载 281 批最小包](https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x/releases/tag/route-sft-reviewed-v4-public)。默认公开包保留每轮全部 233,323 个监督 token 和原批次顺序；因脱敏，1,679/2,248 条样本的工具历史前缀有变，不保证复现原权重或原分数。[数据说明](DATASET.md)给出完整对账。如果已有经过校验的**原始 v4**，可在 `check-route`、`route-sft` 或 `all` 上加 `--data /path/to/original-v4` 使用原实验输入。两种模式不可共用同一工作目录续训。旧公开 v3 的 297 批和仅用自然样本的 186 批都不适用。
-
-### 2. 只做一阶段
-
-可选：在正式训练前，运行四进程 CPU 梯度对照，或在目标机器上做一次四卡真实更新验收。前者不需要 GPU、权重或密钥；它不是四张 A100 的验收报告。后者需要同一 SFT-550 和已核验的样本包，只做内存中的一次更新，不启动评测、不覆盖训练产物。
-
-```bash
-python -m unittest discover -s tests -p test_four_rank_route.py -v
-torchrun --standalone --nproc-per-node=4 scripts/check_route_four_gpu.py --parent "$PARENT" --data "$WORK/route_data/route-sft-reviewed-v4-public"
-```
-
-正式训练：
-
-```bash
-python run.py --work "$WORK" route-sft --parent "$PARENT"
-```
-
-仅训练**不需要**搜索、Judge 或 hint 密钥。不用手工再套一层 `torchrun`，此入口会启动四个训练进程。保存路径分别为 `$WORK/route_sft/checkpoint-00281`、`checkpoint-00562`（续训状态）和 `hf-step-00562`（最终 HF 导出）。如在首轮结束后中断，用同一配置、同一四卡拓扑和工作目录重跑即可从断点恢复；不要把历史单卡的续训状态导入新的四卡 WORK，也不要以旧 281 步输出充当 `PARENT`。
-
-### 3. 末轮评测
-
-等四个 SFT 进程完全退出后再启动绘图器。评测本身保持一张卡运行 Actor；下例假设分配到的设备是 0–3，将 GPU 1 给绘图器、GPU 0 给 Actor（实际编号不同时请一起替换）。另一个终端运行：
-
-```bash
-bash scripts/setup.sh --renderer
-CUDA_VISIBLE_DEVICES=1 bash scripts/serve_renderer.sh --cpu-offload
-```
-
-在训练环境中设置搜索和 Judge 凭据（见 [配置模板](configs/services.env.example)），并确认绘图服务可达：
-
-```bash
-export QWEN_SERVICE_URL=http://127.0.0.1:8001
-read -rsp 'Serper key: ' SERPER_API_KEY; echo; export SERPER_API_KEY
-read -rsp 'Judge key: ' JUDGE_API_KEY; echo; export JUDGE_API_KEY
-# 若服务商不同，设置自己的 JUDGE_BASE_URL；须能提供锁定的 Judge 模型。
-python run.py --work "$WORK" prepare
-CUDA_VISIBLE_DEVICES=0 python run.py --work "$WORK" eval --split bench --policy "$WORK/route_sft/hf-step-00562"
-```
-
-如已有**独立绘图服务**，可直接 `python run.py --work "$WORK" route-sft --parent "$PARENT" --eval`，只在最终导出后测一次。评测使用 Actor temperature 0.6、top-p 0.9、逐题 seed=42+序号；渲染器 Qwen-Image-Edit-2511，Judge `qwen3.7-flash-2026-07-15`，关闭 thinking。服务不可用时不要换 Judge 后仍宣称属于同一对照。真实在线检索、图片下载与服务端评分会波动；固定题目不代表逐次生成相同图片。
-
-看 `summary.json` 的 `all.overall_missing_zero`、`count_eval_success`，以及 `route_telemetry.json` 的 `marker_turns / turns` 和 `cases_with_marker / cases`。不要把成功出图的均分或给定前缀的 marker 概率当成前述指标。需要整个榜单时显式加 `--full-benchmark`。
-
-### 4. 可选：接原有四卡二阶段
-
-在相同工作目录准备官方数据，按[服务模板](configs/services.env.example)配置搜索、评分、绘图和局部 hint 服务。四卡二阶段要用满所有四张卡；若阶段一评测时将绘图器放在 GPU 1，请先退出该实例，将绘图服务放到单独的 GPU 或机器，再启动二阶段：
-
-```bash
-python run.py --work "$WORK" prepare
+python run.py --work "$WORK" route-sft --parent "$PARENT" --eval
 python run.py --work "$WORK" rethink --sft-checkpoint "$WORK/route_sft/hf-step-00562"
 ```
 
-`all --parent "$PARENT"` 是两阶段入口，不是“只做 SFT”；`all --eval` 评的是阶段二的最终策略。二阶段仍是原有四卡 **GRPO＋GenEvolve SDL**：Actor 自己触发重审，局部 hint 仅用于 Teacher；没有把其他环境的蒸馏机制替换进来。[算法说明](TYPE_KL.md)给出一阶段的准确公式。
+原生配方、图文格式及断点见 [NATIVE_SFT.md](NATIVE_SFT.md)。Route-SFT 使用[公开 281 批最小包](https://github.com/leiye302/genevolve-2b-rethink-type-kl-a100-4x/releases/tag/route-sft-reviewed-v4-public)，2,248 条：1,686 Good、562 Bad。同一全局 batch 四卡各处理两条。公开包因脱敏有 1,679 条工具历史变化；每轮 233,323 个监督 token、当前 reasoning、标注和批次顺序不变。持有原始 v4 的人可加 `--data /path/to/original-v4`，不要与公开包共用续训目录。[数据对账](DATASET.md) · [Route-SFT 损失](TYPE_KL.md)。8B 是 Route 样本的采集策略，并非任何训练阶段的起点。
+
+### 产物和运行前检查
+
+- 原生 SFT：`$WORK/native_sft/checkpoint-275`、`checkpoint-550`。Route-SFT：`$WORK/route_sft/checkpoint-00281`、`checkpoint-00562`、`hf-step-00562`。
+- RL：`$WORK/rethink/checkpoint-00010`、`00020`、`00030`、`00040`（均以 `checkpoint-` 开头）；评测模型在 `hf-step-00010`、`hf-step-00020`、`hf-step-00030` 及 `final`。权重可用于推理不代表可续训，归档时要同时保留原生训练状态、配置、数据身份、日志和评测目录。
+- 评测：`$WORK/eval/` 按模型和范围分目录保存病例记录、图片和官方评分汇总；固定 8 题另存 `fixed8_metrics.json`。基础设施失败不是模型得零分；先排查服务再续跑。最终报告请使用 **40 步模型的全量目录**，不要误取其 8 题均分。
+- 不占 GPU 的检查：`bash scripts/setup.sh --sources-only`，安装 `requirements-smoke.txt` 及 CPU PyTorch 后执行 `python -m unittest discover -s tests -v`。要在目标机验证 Route-SFT 真卡显存与通信，可单独运行 `torchrun --standalone --nproc-per-node=4 scripts/check_route_four_gpu.py --parent "$PARENT" --data "$WORK/route_data/route-sft-reviewed-v4-public"`；这只做一次丢弃的内存更新，不改训练断点。

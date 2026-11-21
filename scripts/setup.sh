@@ -47,6 +47,7 @@ fi
 if [[ "$mode" != --renderer ]]; then
     mkdir -p .deps
     fetch_pin agent .deps/genevolve
+    fetch_pin sft_trainer .deps/llamafactory
 fi
 if [[ "$mode" == --sources-only ]]; then
     exit 0
@@ -79,7 +80,8 @@ if [[ "$mode" == --renderer ]]; then
     "$py" -c 'from diffusers import QwenImageEditPlusPipeline'
 else
     "$py" -m pip install --no-build-isolation -r requirements.txt
+    "$py" -m pip install -c requirements.txt -e .deps/llamafactory
     MAX_JOBS="${GENEVOLVE_BUILD_JOBS:-4}" "$py" -m pip install --no-build-isolation flash-attn==2.8.3
-    "$py" -c 'import flash_attn, torch; from transformers import Qwen3VLForConditionalGeneration; assert torch.version.cuda == "12.8"'
+    "$py" -c 'import deepspeed, flash_attn, llamafactory, torch; from transformers import Qwen3VLForConditionalGeneration; assert torch.version.cuda == "12.8"'
 fi
 "$py" -m pip check

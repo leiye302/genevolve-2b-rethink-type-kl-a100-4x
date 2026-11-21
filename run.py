@@ -77,18 +77,43 @@ def route_data_folder(work, given):
     return prepare_route(work)
 
 
-def run_pipeline(args, work):
-    """Run the two method stages under the caller's single work-directory lock."""
+def ensure_bench(work):
     from genevolve_repro.data import prepare, verify_data
+    # Never replace a corrupt / mismatched split with a different local benchmark.
+    try:
+        verify_data(work)
+    except (ValueError, FileNotFoundError):
+        prepare(work)
+
+
+def dispatch_bench(work, policy, max_cases):
+    execute(argparse.Namespace(command="eval", policy=policy, split="bench", max_cases=max_cases), work)
+
+
+def official_steps(value):
+    if value not in (None, 40):
+        raise ValueError("The published RETHINK experiment runs exactly 40 RL updates; --steps must be 40.")
+    return 40
+
+
+def run_pipeline(args, work):
+    """One job lock; resume completed stages and evaluations from their sealed artifacts."""
+    from genevolve_repro.native_sft import run_native
     from genevolve_repro.route_data import pack_manifest, recipe, route_identity, verify_parent
+    from genevolve_repro.route_sft import verify_route_export
+    from genevolve_repro.rl_milestones import run_bench_eval
     from genevolve_repro.runtime import preflight
 
-    validate_steps(args.steps)
+    official_steps(args.steps)
     check_rethink_services()
     load_upstream()
+    ensure_bench(work)
     cfg = recipe()
-    parent = args.parent.resolve()
+    # Optional explicit reuse; by default train from the pinned bare public base.
+    parent = args.parent.resolve() if args.parent else run_native(work)
     parent_id = verify_parent(parent, cfg)
+    evaluate = lambda policy, count: dispatch_bench(work, policy, count)
+    run_bench_eval(work, parent, default_eval_cases(), evaluate)
     data = route_data_folder(work, args.data)
     pack = pack_manifest(data, cfg)
     contract = route_identity(data, pack, cfg, parent_id)
@@ -97,33 +122,42 @@ def run_pipeline(args, work):
     route_ready = all((route_export / name).is_file() for name in ("completed.json", "export_sha256.json"))
     if not route_ready:
         preflight("route-sft", work)
-
-    # Avoid contacting the dataset host on resume if the pinned data and
-    # paired reference images are already available in this work directory.
-    try:
-        verify_data(work)
-    except (ValueError, FileNotFoundError):
-        prepare(work)
-
-    if not route_ready:
-        print(f"Stage 1: Route-SFT ({total} updates)", flush=True)
+        print(f"Route-SFT: {total} updates from the verified native SFT-550", flush=True)
         distributed("_route-sft", work, "--parent", str(parent), "--data", str(data))
-    else:
-        print("Stage 1: found existing Route-SFT export; checking handoff", flush=True)
-    print("Stage 2: GenEvolve GRPO + native SDL with Actor-routed hints", flush=True)
-    # The same handoff as the standalone subcommand also validates the
-    # checkpoint on repeat invocations before any stage-2 workers start.
-    execute(argparse.Namespace(command="rethink", sft_checkpoint=route_export, steps=args.steps,
-                               route_contract=contract), work)
-    if args.eval:
-        print("Final stage-2 evaluation: fixed 8-case GenEvolve-Bench subset", flush=True)
-        execute(argparse.Namespace(command="eval", split="bench", max_cases=default_eval_cases(),
-                                   policy=work / "rethink" / "final"), work)
+    route_id = verify_route_export(route_export, expected_contract=contract)
+    run_bench_eval(work, route_export, default_eval_cases(), evaluate)
+    run_rethink_40(work, route_export, route_id)
+
+
+def run_rethink_40(work, route_export, route_id):
+    from genevolve_repro.data import embedding_ready, prepare_embedding
+    from genevolve_repro.rl_milestones import run_schedule
+    from genevolve_repro.runtime import check_milestone_space, preflight
+
+    if not embedding_ready(work):
+        prepare_embedding(work)
+    def train_to(stop):
+        check_milestone_space(work, route_export)
+        preflight("rethink", work)
+        distributed("_rethink", work, "--sft-checkpoint", str(route_export), "--steps", "40",
+                    "--stop-after", str(stop))
+    run_schedule(work, route_id, train_to, lambda policy, count: dispatch_bench(work, policy, count))
 
 
 def execute(args, work):
     if args.command == "all":
         run_pipeline(args, work)
+        return
+    if args.command in {"prepare-native", "native-sft"}:
+        from genevolve_repro.native_sft import prepare_native, run_native
+        if args.command == "prepare-native":
+            prepare_native(work)
+            return
+        parent = run_native(work)
+        if args.eval:
+            from genevolve_repro.rl_milestones import run_bench_eval
+            ensure_bench(work)
+            run_bench_eval(work, parent, default_eval_cases(), lambda policy, n: dispatch_bench(work, policy, n))
         return
     if args.command in {"grpo", "rethink"}:
         export_files(args.sft_checkpoint)
@@ -133,13 +167,14 @@ def execute(args, work):
         for key in ("SERPER_API_KEY", *keys):
             required_env(key)
     if args.command == "rethink":
-        from genevolve_repro.data import embedding_ready, prepare_embedding
         from genevolve_repro.route_sft import verify_route_export
 
+        official_steps(args.steps)
         check_rethink_services()
-        verify_route_export(args.sft_checkpoint.resolve(), expected_contract=getattr(args, "route_contract", None))
-        if not embedding_ready(work):
-            prepare_embedding(work)
+        ensure_bench(work)
+        policy = args.sft_checkpoint.resolve()
+        run_rethink_40(work, policy, verify_route_export(policy))
+        return
     if args.command == "prepare":
         from genevolve_repro.data import prepare
         prepare(work)
@@ -180,7 +215,7 @@ def execute(args, work):
             verify_route_export(export)
             execute(argparse.Namespace(command="eval", policy=export, split="bench",
                                        max_cases=default_eval_cases()), work)
-    if args.command in {"grpo", "rethink"}:
+    if args.command == "grpo":
         from genevolve_repro.runtime import preflight
 
         preflight(args.command, work)
@@ -200,24 +235,27 @@ def sft_flag(parser):
                         help="Qwen3-VL-2B HF export; Route-SFT final for rethink, baseline SFT-550 for GRPO")
 
 
-def route_flags(parser, *, internal=False):
+def route_flags(parser, *, internal=False, from_base=False):
     parser.add_argument("--data", required=internal, type=Path,
                         help="verified 281-batch Route-SFT pack (default: use the pinned public release)")
-    parser.add_argument("--parent", required=True, type=Path, help="matching GenEvolve 2B SFT checkpoint-550 HF export")
+    parser.add_argument("--parent", required=not from_base, type=Path, help="verified GenEvolve SFT-550; omit on all to train it from base")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GenEvolve 2B: four-A100 two-epoch Route-SFT, native four-GPU SDL")
+    parser = argparse.ArgumentParser(description="4×A100 GenEvolve 2B: native SFT-550 → Route-SFT-562 → RETHINK RL-40")
     parser.add_argument("--work", type=Path, default=ROOT / "work")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare", help="download pinned RL and benchmark splits")
     commands.add_parser("prepare-route", help="download and check the public Route-SFT pack (CPU only)")
     commands.add_parser("prepare-embedding", help="download GenEvolve's pinned experience-retrieval model")
+    commands.add_parser("prepare-native", help="prepare the original SFT data and bare 2B base")
+    commands.add_parser("native-sft", help="train or resume just the native SFT-550").add_argument(
+        "--eval", action="store_true", help="also evaluate its final checkpoint on fixed 8")
     sft_flag(commands.add_parser("check-sft", help="check and fingerprint an existing SFT export"))
-    pipeline = commands.add_parser("all", help="prepare data and run both method stages")
-    route_flags(pipeline)
-    pipeline.add_argument("--steps", type=int, help="planned stage-2 updates (default: 322, same as the baselines)")
-    pipeline.add_argument("--eval", action="store_true", help="also score the final stage-2 policy on the fixed eight cases")
+    pipeline = commands.add_parser("all", help="all three stages, six fixed-8 evaluations and a final full benchmark")
+    route_flags(pipeline, from_base=True)
+    pipeline.add_argument("--steps", type=int, choices=[40], default=40, help="published RL horizon (40)")
+    pipeline.add_argument("--eval", action="store_true", help="accepted for compatibility; all scheduled evaluations are mandatory")
     for name in ("check-route", "route-sft", "_route-sft"):
         parser_stage = commands.add_parser(name)
         route_flags(parser_stage, internal=name == "_route-sft")
@@ -227,7 +265,12 @@ def main():
     for name in ("grpo", "_grpo", "rethink", "_rethink"):
         stage = commands.add_parser(name)
         sft_flag(stage)
-        stage.add_argument("--steps", type=int, help="RL updates (default: one pass over the train split)")
+        if name in {"rethink", "_rethink"}:
+            stage.add_argument("--steps", type=int, choices=[40], default=40, help="published RETHINK RL horizon")
+        else:
+            stage.add_argument("--steps", type=int, help="baseline only: RL updates (default: one pass over the train split)")
+        if name == "_rethink":
+            stage.add_argument("--stop-after", type=int, required=True, choices=(10,20,30,40))
     for name in ("eval", "_eval"):
         eval_flags(commands.add_parser(name))
     args = parser.parse_args()
@@ -262,7 +305,8 @@ def main():
         worker(work, args.parent.resolve(), args.data.resolve())
     elif args.command in {"_grpo", "_rethink"}:
         from genevolve_repro.evolve import worker
-        worker(work, args.sft_checkpoint.resolve(), args.steps, rethink=args.command == "_rethink")
+        worker(work, args.sft_checkpoint.resolve(), args.steps, rethink=args.command == "_rethink",
+               stop_after=getattr(args, "stop_after", None))
     elif args.command == "_eval":
         from genevolve_repro.evaluate import worker
         policy = args.policy.resolve() if args.policy else final_route_export(work)

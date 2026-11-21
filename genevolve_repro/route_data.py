@@ -6,6 +6,7 @@ import re
 
 from .actor_text import ACTOR_TEXT_PROTOCOL, decode_actor_response
 from .common import ROOT, jsonl, read_json
+from .native_handoff import NATIVE_KEY, RECEIPT, verify_native_identity, verify_native_parent
 from .route_release import release_lock
 from .sft_export import MODEL_FAMILY, REQUIRED, file_sha256, sft_manifest
 
@@ -99,12 +100,19 @@ def verify_parent_identity(identity, cfg=None):
             and all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value)
                     for value in hashes.values()),
             "Incomplete 2B parent fingerprint.")
-    require(identity == read_json(ROOT / "configs/sft550_sha256.json"), "Weights/tokenizer differ from the exact SFT-550 parent.")
+    if NATIVE_KEY in identity:
+        return verify_native_identity(identity)
+    require(identity == read_json(ROOT / "configs/sft550_sha256.json"),
+            "Weights/tokenizer differ from the exact SFT-550 parent. A fresh native run needs its validated training receipt.")
     return identity
 
 
 def verify_parent(parent, cfg=None):
-    return verify_parent_identity(sft_manifest(parent), cfg)
+    parent = Path(parent)
+    identity = sft_manifest(parent)
+    if (parent / RECEIPT).exists():
+        identity = verify_native_parent(parent, identity)
+    return verify_parent_identity(identity, cfg)
 
 
 def load_pack(folder, cfg, manifest=None):
