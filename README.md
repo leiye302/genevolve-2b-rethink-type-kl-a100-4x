@@ -34,6 +34,9 @@ python run.py --work "$WORK" all
 `ssh -N -L 18001:127.0.0.1:8001 USER@RENDER_HOST`，并在训练进程设置
 `QWEN_SERVICE_URL=http://127.0.0.1:18001`。不需要把绘图服务开放到公网。
 hint 的 `GENEVOLVE_HINT_API_URL` 必须是完整 HTTPS `/chat/completions` 地址，不是只到 `/v1` 的基址。
+建议在启动长任务前，从训练机对每个仓库自带的渲染端点执行一次
+`curl -fsS "http://127.0.0.1:18001/health"`（地址按实际环境替换）。
+这只确认服务可达；有余额的 Judge/hint、可用的搜索及真实出图仍需分别核验，程序不会因为环境变量非空就证明服务可用。
 
 ### 单独准备或运行
 
