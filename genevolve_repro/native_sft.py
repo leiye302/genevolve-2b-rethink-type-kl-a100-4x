@@ -17,6 +17,15 @@ def trainer_root():
     return ROOT/'.deps/llamafactory'
 
 
+def effective_recipe():
+    # Keep the original, separately fingerprinted config visible for comparison.
+    cfg=read_json(ROOT/'configs/native_sft.json')
+    change=read_json(ROOT/'configs/native_sft_save.json')
+    if change!={'save_strategy':'steps','save_steps':550} or cfg['save_strategy']!='epoch':
+        raise ValueError('Only the native checkpoint cadence may differ from upstream.')
+    return {**cfg,**change}
+
+
 def native_contract():
     """Path-independent and CPU/dependency-free; also used when importing a completed parent."""
     lock=source_lock()
@@ -26,9 +35,10 @@ def native_contract():
     if git_digest(b'blob',text).hex()!=assets['upstream_sft_json_git_blob']:
         raise ValueError('Native SFT recipe differs from its pinned 2B upstream revision.')
     return {
-        'format':'genevolve-original-multimodal-2b-sft550-v1',
+        'format':'genevolve-original-multimodal-2b-sft550-final-save-v2',
         'sources':{k:lock[k] for k in ('base','data','cold_start','sft_trainer')},
-        'inputs':assets, 'lhf_recipe':read_json(native_recipe),
+        'inputs':assets, 'lhf_recipe':effective_recipe(),
+        'checkpoint_policy':{'save_at':[550],'epoch_validation_at':[275,550]},
         'four_rank_topology':{'world_size':4,'micro_batch_per_gpu':2,'gradient_accumulation':4,
                               'global_batch':32,'epochs':2,'optimizer_updates':550},
         'runtime':{'python':'3.11','torch':'2.8.0','cuda':'12.8','transformers':'4.57.1',
@@ -99,19 +109,19 @@ def native_checkpoint(folder,step):
     return folder
 
 
-def launch_config(work, resume=None):
+def launch_config(work):
     work=Path(work).resolve()
-    cfg=read_json(ROOT/'configs/native_sft.json')
+    cfg=effective_recipe()
     folder=work/'data'/inputs()['dataset_folder']
     cfg.update(model_name_or_path=str(work/'base'), dataset_dir=str(folder),media_dir=str(folder),
                output_dir=str(work/'native_sft'),deepspeed=str(trainer_root()/'examples/deepspeed/ds_z3_config.json'))
-    if resume is not None:cfg['resume_from_checkpoint']=str(resume)
     return cfg
 
 
 def run_native(work):
     """Driver, called once on the host, not by four torchrun child processes."""
-    from .native_handoff import RECEIPT, seal_native_parent
+    from .native_handoff import RECEIPT, is_legacy_contract, seal_native_parent, verify_native_parent
+    from .sft_export import sft_manifest
     from .native_sft_probe import verify_labels
     work=Path(work).resolve()
     out=work/'native_sft'
@@ -123,13 +133,23 @@ def run_native(work):
     if out.is_symlink() or meta.is_symlink() or bind.is_symlink() or success.is_symlink():
         raise ValueError('Refusing linked native output/provenance directory.')
     if bind.is_file():
-        if read_json(bind)!=contract:raise ValueError('Native run contract changed. Use a fresh WORK.')
+        previous=read_json(bind)
+        if previous!=contract:
+            # Only recognize a *completed and previously sealed* old run, never
+            # resume its 275 checkpoint or mint a legacy attestation here.
+            if (is_legacy_contract(previous) and (final/RECEIPT).is_file() and success.is_file()
+                    and read_json(success)=={'contract':previous,'completed':550}):
+                identity=verify_native_parent(final,sft_manifest(final))
+                if identity['native_parent_provenance']['native_training_contract']==previous:
+                    return final
+            raise ValueError('Native run contract changed. Preserve old outputs and use a fresh WORK.')
     elif out.exists() and (not out.is_dir() or any(out.iterdir())) or (meta.exists() and any(meta.iterdir())):
         raise ValueError('Refusing pre-existing unbound native outputs. Use a fresh WORK.')
     def finish():
         if not bind.is_file() or not success.is_file() or read_json(success)!={'contract':contract,'completed':550}:
             raise ValueError('No matching successful native invocation; cannot issue a parent receipt.')
-        native_checkpoint(out/'checkpoint-275',275)
+        if set(out.glob('checkpoint-*'))!={final}:
+            raise ValueError('Unexpected native checkpoint: new runs save only step 550.')
         native_checkpoint(final,550)
         if not (out/'trainer_state.json').is_file() or read_json(out/'trainer_state.json').get('global_step')!=550:
             raise ValueError('Native training did not finalize all 550 updates.')
@@ -137,18 +157,17 @@ def run_native(work):
         return final
     if success.is_file():return finish()
     if (final/RECEIPT).exists() or final.exists():
-        raise ValueError('Unconfirmed step-550 output: recover the original run records, or resume from its verified '
-                         '275 checkpoint after archiving the incomplete/unconfirmed 550 output; not sealing it.')
-    unknown=set(out.glob('checkpoint-*'))-{out/'checkpoint-275'}
-    if unknown:raise ValueError('Unexpected native checkpoints. Use a fresh WORK.')
-    resume=native_checkpoint(out/'checkpoint-275',275) if (out/'checkpoint-275').exists() else None
+        raise ValueError('Unconfirmed step-550 output: preserve these files and use a fresh WORK to restart '
+                         'from the bare base; not sealing or resuming unconfirmed state.')
+    if any(out.glob('checkpoint-*')):
+        raise ValueError('Unexpected intermediate native checkpoint. Preserve it and use a fresh WORK.')
     verify_runtime(contract)
     work.mkdir(parents=True,exist_ok=True)
-    need=(65 if resume else 105)*2**30
+    need=75*2**30
     if shutil.disk_usage(work).free<need:
-        raise ValueError(f'Native original data, two full saves and HF export require at least {need//2**30} GiB free.')
+        raise ValueError(f'Native data, final resumable save and HF export require at least {need//2**30} GiB free.')
     base,folder=prepare_native(work)
-    cfg=launch_config(work,resume)
+    cfg=launch_config(work)
     labels=verify_labels(base,folder,cfg)
     write_json(meta/'native-label-probe.json',labels)
     write_json(bind,contract)
@@ -156,7 +175,8 @@ def run_native(work):
     write_json(args,cfg)
     subprocess.run([sys.executable,'-m','torch.distributed.run','--standalone','--nnodes=1','--nproc-per-node=4',
                     '--module','llamafactory.launcher',str(args)],cwd=ROOT,check=True)
-    native_checkpoint(out/'checkpoint-275',275)
+    if set(out.glob('checkpoint-*'))!={final}:
+        raise ValueError('Trainer did not follow the final-only native checkpoint cadence.')
     native_checkpoint(final,550)
     export_files(out)
     if read_json(out/'trainer_state.json').get('global_step')!=550:

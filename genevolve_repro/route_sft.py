@@ -60,7 +60,16 @@ def verify_route_export(path, cfg=None, expected_contract=None):
         raise ValueError("Stage 2 must start from the complete configured Route-SFT HF export.")
     verify_artifact_identity(identity.get("manifest_sha256"), identity.get("artifact_sha256"), cfg)
     verify_parent_identity(identity.get("parent"), cfg)
-    if expected_contract is not None and identity != expected_contract:
+    # Older *completed* HF-562 outputs also saved a midpoint optimizer state.
+    # That persistence-only difference does not change the learned policy.
+    # Never normalize identities on write or when resuming training.
+    if "save_resumable_at" in identity and identity["save_resumable_at"] not in ([562], [281,562]):
+        raise ValueError("Unrecognized final Route-SFT export save schedule.")
+    comparable = identity
+    if (expected_contract is not None and identity.get("save_resumable_at")==[281,562]
+            and expected_contract.get("save_resumable_at")==[562]):
+        comparable = {**identity, "save_resumable_at":[562]}
+    if expected_contract is not None and comparable != expected_contract:
         raise ValueError("Route-SFT export does not match the supplied 2B parent and v4 pack; use a new WORK.")
     receipt = read_json(path / "export_sha256.json") if (path / "export_sha256.json").is_file() else {}
     manifest = sft_manifest(path)
@@ -207,20 +216,23 @@ def worker(work, parent, data):
         out=work.resolve()/'route_sft';out.mkdir(parents=True,exist_ok=True)
         hardware={'world_size':size,'cpu_offload':prof['cpu_offload']}
         if (out/'hardware.json').exists():require(hardware==read_json(out/'hardware.json'), 'Resume hardware profile mismatch.')
-        if rank==0:write_json(out/'hardware.json',hardware)
-        known={out/'checkpoint-00281', out/'checkpoint-00562'}
-        require(set(out.glob('checkpoint-*'))<=known,'Unrelated checkpoint in output folder; refusing to overwrite or prune')
+        known={out/'checkpoint-00562'}
+        require(set(out.glob('checkpoint-*'))<=known and set(out.glob('hf-step-*'))<={out/'hf-step-00562'},
+                'This run saves only at step 562. A legacy midpoint or unrelated checkpoint/export exists; use a fresh output root.')
         cp=latest(out)
         if cp:require((cp/'state_sha256.json').is_file(),'Unaudited prior training checkpoint')
         if (out/'contract.json').exists():require(c==read_json(out/'contract.json'),'Run directory contract differs.')
-        if not cp:require(not any(out.glob('metrics/step-*.json')), 'Partial prior training found without a resumable checkpoint; use a fresh output root')
-        if rank==0:write_json(out/'contract.json',c)
+        if not cp:require(not any(out.glob('metrics/step-*.json')) and not (out/'hf-step-00562').exists(),
+                          'Partial prior training found without the final resumable checkpoint; preserve the old outputs and use a fresh output root.')
+        if rank==0:
+            write_json(out/'hardware.json',hardware)
+            write_json(out/'contract.json',c)
         cfg=c['config']; total=len(batches)*cfg['epochs']
         require(total==562 and len(batches)==281,'Wrong epoch mapping')
-        need={None:58,'checkpoint-00281':35,'checkpoint-00562':9}[cp.name if cp else None]
+        need=9 if cp else 35
         require(shutil.disk_usage(out).free >= need*2**30,f'Not enough disk; need >= {need} GiB for outstanding saves.')
         saved=load_checkpoint(cp) if cp else None;start=saved['step'] if saved else 0
-        require(not saved or (saved['contract']==c and start in (281,total) and len(saved['rng'])==size
+        require(not saved or (saved['contract']==c and start==total and len(saved['rng'])==size
                               and cp.name==f'checkpoint-{start:05d}'),'Invalid saved state or checkpoint world size')
         references=None
         if start<total:
@@ -247,7 +259,7 @@ def worker(work, parent, data):
             if rank==0:
                 write_json(out/'metrics'/f'step-{n:05d}.json',metrics)
                 if n==1 or n%5==0 or n==total:print(metrics,flush=True)
-            if n%len(batches)==0:save_checkpoint(out,actor,opt,sched,n,c,rank,device,keep=2,verify=True)
+            if n==total:save_checkpoint(out,actor,opt,sched,n,c,rank,device,keep=1,verify=True)
         del opt,sched;gc.collect();torch.cuda.empty_cache()
         hf=out/f'hf-step-{total:05d}'
         if _rank0_bool(not hf.exists() if rank==0 else False,size):

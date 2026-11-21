@@ -11,7 +11,7 @@ def check_milestone_space(work, policy):
     # The Route export is BF16: FP32 actor plus two FP32 Adam moments <= 6 copies.
     weight_bytes = sum((policy / f).stat().st_size for f in export_files(policy) if f.endswith(".safetensors"))
     out = work / "rethink"
-    states = sum(not (out / f"checkpoint-{n:05d}" / "training.pt").is_file() for n in (10, 20, 30, 40))
+    states = int(not (out / "checkpoint-00040" / "training.pt").is_file())
     exports = sum(not (out / name / "completed.json").is_file()
                   for name in ("hf-step-00010", "hf-step-00020", "hf-step-00030", "final"))
     available = shutil.disk_usage(work).free
@@ -41,8 +41,7 @@ def preflight(stage, work):
                     raise ValueError(f"Route-SFT needs >=68 GiB free on each A100; visible device {i} "
                                      f"has {free / 2**30:.1f} GiB. Stop the renderer or move it to another GPU.")
         folder = work / "route_sft"
-        need = (9 if (folder / "checkpoint-00562" / "state_sha256.json").is_file() else
-                35 if (folder / "checkpoint-00281" / "state_sha256.json").is_file() else 58)
+        need = 9 if (folder / "checkpoint-00562" / "state_sha256.json").is_file() else 35
         if shutil.disk_usage(work).free < need * 2**30:
             raise ValueError(f"Allow at least {need} GiB free in WORK for outstanding Route-SFT saves.")
         return
@@ -60,5 +59,5 @@ def preflight(stage, work):
     # Native FSDP stores one FP32 actor and FP32 Adam states in each full
     # checkpoint. Allow for two existing checkpoints plus a temporary save.
     folder = work / stage
-    if not (folder / "contract.json").is_file() and shutil.disk_usage(work).free < 100 * 2**30:
+    if stage == "grpo" and not (folder / "contract.json").is_file() and shutil.disk_usage(work).free < 100 * 2**30:
         raise ValueError("Allow at least 100 GiB free in WORK for 2B checkpoint space; dataset and renderer are separate.")

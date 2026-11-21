@@ -44,10 +44,9 @@ class ThreeStages(unittest.TestCase):
         # additionally exercise scoring contracts, partial results and real RNG restoration.
         def schedule(work, identity, train, evaluate):
             self.assertIs(identity, self.events.verified.return_value)
-            for n in (10,20,30,40):
-                train(n)
-                policy = work / "rethink" / ("final" if n == 40 else f"hf-step-{n:05d}")
-                evaluate(policy, 8)
+            train()
+            policy = work / "rethink" / "final"
+            evaluate(policy, 8)
             evaluate(policy, None)
         self.events.schedule.side_effect = schedule
 
@@ -65,11 +64,10 @@ class ThreeStages(unittest.TestCase):
         expected = [self.evalcall(self.native),
                     call("_route-sft", self.work, "--parent", str(self.native), "--data", str(self.pack)),
                     self.evalcall(self.route)]
-        for n in (10, 20, 30, 40):
-            expected += [call("_rethink", self.work, "--sft-checkpoint", str(self.route),
-                              "--steps", "40", "--stop-after", str(n)),
-                         self.evalcall(self.work / "rethink" / ("final" if n == 40 else f"hf-step-{n:05d}"))]
-        expected += [self.evalcall(self.work / "rethink" / "final", None)]
+        expected += [call("_rethink", self.work, "--sft-checkpoint", str(self.route),
+                          "--steps", "40", "--milestone-eval"),
+                     self.evalcall(self.work / "rethink" / "final"),
+                     self.evalcall(self.work / "rethink" / "final", None)]
         self.assertEqual(self.events.launch.call_args_list, expected)
         self.events.verified.assert_called_once_with(self.route, expected_contract=self.events.identity.return_value)
 

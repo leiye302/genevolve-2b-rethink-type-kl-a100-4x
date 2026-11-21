@@ -273,3 +273,16 @@ def worker(work, policy, split, max_cases):
         _evaluate(work, policy, split, max_cases, rank, size, device)
     finally:
         dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    # Private child of the live RL leader. No torchrun, process group, trainer
+    # work lock, or inherited training RNG. Rendering/Judge settings are unchanged.
+    import argparse
+    parser = argparse.ArgumentParser(description="Isolated fixed-eight GenEvolve milestone evaluator")
+    parser.add_argument("--work", required=True, type=Path)
+    parser.add_argument("--policy", required=True, type=Path)
+    args = parser.parse_args()
+    if dist.is_initialized() or torch.cuda.device_count() != 1:
+        raise SystemExit("The isolated evaluator must see one assigned GPU and no training process group.")
+    _evaluate(args.work.resolve(), args.policy.resolve(), "bench", 8, 0, 1, torch.device("cuda", 0))

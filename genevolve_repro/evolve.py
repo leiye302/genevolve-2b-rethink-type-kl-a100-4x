@@ -24,7 +24,7 @@ from .policy import ActorScorer, make_agent, score_turn
 from .route_data import verify_parent
 from .route_sft import verify_route_export
 from .sft_export import file_sha256
-from .rl_milestones import STOPS, export_meta, policy_path, stop_step
+from .rl_milestones import STOPS, STORAGE, TOTAL, control_group, export_meta, live_fixed8, policy_path, protect_training_rng, require_restartable
 from . import teacher
 
 
@@ -122,7 +122,7 @@ def write_rollouts(folder, group, use_sdl=False):
     })
 
 
-def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=None):
+def _loop(work, sft, rank, size, device, limit, *, rethink=False, milestone_eval=False):
     from transformers import AutoProcessor, AutoTokenizer
 
     load_upstream()
@@ -145,7 +145,8 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=Non
         raise RuntimeError("The pinned RL train split must contain 2,575 prompts.")
     random.Random(cfg["seed"]).shuffle(pool)
     total = limit if limit is not None else math.ceil(len(pool) / cfg["prompt_batch"])
-    stop = stop_step(total, stop_after, rethink)
+    if milestone_eval and (not rethink or total != TOTAL or size != 4):
+        raise ValueError("The continuous 10/20/30/40 protocol requires four-rank rethink --steps 40.")
     if total < 1:
         raise ValueError("At least one RL update is required.")
     out = work / ("rethink" if rethink else "grpo")
@@ -166,19 +167,22 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=Non
                             name: file_sha256(ROOT / "configs" / name)
                             for name in ("local_hint_system.txt",)
                         })
-    if stop_after is not None:
-        contract["milestones"] = list(STOPS)  # stop_after is execution state, not part of the training recipe
+    if milestone_eval:
+        contract.update(milestones=list(STOPS), storage=STORAGE)
+        # Rank zero checks the pre-existing directory before anyone writes into
+        # it. Only a finalized step-40 state may resume in this work directory.
+        if rank == 0:
+            require_restartable(work)
+        gather(rank)
     if (out / "contract.json").is_file() and read_json(out / "contract.json") != contract:
         raise RuntimeError("This work directory has a different RL, SFT, or training-data identity.")
     if rank == 0:
         write_json(out / "contract.json", contract)
-    if stop_after is None and model_ready(final) and (final / "completed.json").is_file() and read_json(final / "completed.json")["step"] == total:
+    if not milestone_eval and model_ready(final) and (final / "completed.json").is_file() and read_json(final / "completed.json")["step"] == total:
         if rank == 0:
             print(f"RL complete at {final}", flush=True)
         return
     checkpoint_path = latest(out)
-    if stop_after is not None and checkpoint_path is not None and not (checkpoint_path / "state_sha256.json").is_file():
-        raise ValueError("Milestone resume requires a verified complete state.")
     saved = load_checkpoint(checkpoint_path) if checkpoint_path else None
     if saved and saved["contract"] != contract:
         raise RuntimeError("Saved checkpoint configuration does not match this run.")
@@ -187,14 +191,12 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=Non
             raise RuntimeError("Incomplete GenEvolve checkpoint: missing the experience bank.")
         memory = ExperienceBank(cfg["experience_capacity"], saved["memory"] if saved else None)
     start = saved["step"] if saved else 0
-    if stop_after is not None:
-        if (start not in (0, *STOPS) or start > stop or (saved and
+    if milestone_eval:
+        if (start not in (0, TOTAL) or (saved and
                 (len(saved["rng"]) != size or saved["scheduler"]["T_max"] != total
                  or saved["scheduler"]["last_epoch"] != start
                  or checkpoint_path.name != f"checkpoint-{start:05d}"))):
             raise ValueError("Unexpected resume state/step for the 40-update RL schedule.")
-        if stop != start and stop - start != 10:
-            raise ValueError("Run consecutive milestones; do not skip an evaluation boundary.")
     random.seed(cfg["seed"] + rank)
     torch.manual_seed(cfg["seed"] + rank)
     actor = make_sharded_actor(sft, device, saved["actor"] if saved else None)
@@ -222,7 +224,8 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=Non
     if rng:
         restore_rng(rng, device)
 
-    for step in range(start, stop):
+    eval_group = control_group() if milestone_eval and start < total else None
+    for step in range(start, total):
         replica.to(device)
         copy_actor(actor, replica)
         scorer = ActorScorer(replica)
@@ -283,24 +286,33 @@ def _loop(work, sft, rank, size, device, limit, *, rethink=False, stop_after=Non
                 row["rethink/trigger_fraction"] = row["rethink/generated_marker"] / max(1, row["rethink/turns"])
             write_json(out / "metrics" / f"step-{step + 1:05d}.json", row)
             print(row, flush=True)
-        due = (step + 1) == stop if stop_after is not None else ((step + 1) % cfg["save_every"] == 0 or step + 1 == total)
+        n = step + 1
+        if milestone_eval and n in STOPS[:-1]:
+            # Keep the complete trainer alive in THIS process. Only the BF16
+            # model/processor is serialized (no temporary optimizer/RNG/bank).
+            hf = policy_path(work, n)
+            optimizer.zero_grad(set_to_none=True)
+            with protect_training_rng(device):
+                export_policy(hf, actor, replica, processor, n, rank, metadata=export_meta(contract), seal=True)
+                live_fixed8(work, hf, rank, eval_group)
+        due = n == total if milestone_eval else (n % cfg["save_every"] == 0 or n == total)
         if due:
             save_checkpoint(out, actor, optimizer, scheduler, step + 1, contract, rank, device,
-                            keep=len(STOPS) if stop_after is not None else cfg["keep_checkpoints"],
-                            verify=stop_after is not None, memory=memory if rethink else None)
+                            keep=1 if milestone_eval else cfg["keep_checkpoints"],
+                            verify=milestone_eval, memory=memory if rethink else None)
 
-    if stop_after is None:
+    if not milestone_eval:
         export_policy(final, actor, replica, processor, total, rank)
     else:
-        hf = policy_path(work, stop)
-        state = read_json(out / f"checkpoint-{stop:05d}" / "state_sha256.json")["training.pt"]
+        hf = policy_path(work, total)
+        state = read_json(out / f"checkpoint-{total:05d}" / "state_sha256.json")["training.pt"]
         if not hf.exists():
-            export_policy(hf, actor, replica, processor, stop, rank, metadata=export_meta(contract, state), seal=True)
+            export_policy(hf, actor, replica, processor, total, rank, metadata=export_meta(contract, state), seal=True)
 
 
-def worker(work, sft, limit, *, rethink=False, stop_after=None):
+def worker(work, sft, limit, *, rethink=False, milestone_eval=False):
     rank, size, device = initialize()
     try:
-        _loop(work, sft, rank, size, device, limit, rethink=rethink, stop_after=stop_after)
+        _loop(work, sft, rank, size, device, limit, rethink=rethink, milestone_eval=milestone_eval)
     finally:
         dist.destroy_process_group()

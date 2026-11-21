@@ -29,6 +29,12 @@ def canonical_sha(obj):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def is_legacy_contract(contract):
+    # Canonical JSON of native_contract() at 72514a4f3c39ac972fcc348c35bd0e6f41cc78e1.
+    # A read-only allowlist entry, *not* an alternate recipe for new training or sealing.
+    return canonical_sha(contract)=="c5b8becf2b85d41d8c1331c5ec830f845031c00b27f2a012f2a5883a3785ffcd"
+
+
 def _pinned_contract():
     # Dependency-free native prep is imported lazily. Legacy parents need none of it.
     from .native_sft import native_contract
@@ -100,7 +106,7 @@ def verify_native_identity(identity):
           "Invalid generated native parent receipt.")
     _check_resume_inventory(att["resume_sha256"])
     _need(hf["sft_global_step"]==STEP and att["schema"]==SCHEMA and
-          att["native_training_contract"]==_pinned_contract() and
+          (att["native_training_contract"]==_pinned_contract() or is_legacy_contract(att["native_training_contract"])) and
           att["hf_manifest_sha256"]==canonical_sha(hf) and
           att["binding_sha256"]==canonical_sha({k:v for k,v in att.items() if k!="binding_sha256"}),
           "Generated native parent provenance or bound HF fingerprint differs.")

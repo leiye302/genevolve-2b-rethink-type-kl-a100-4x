@@ -28,6 +28,21 @@ def fake_export(folder):
 
 
 class ContractTest(unittest.TestCase):
+    def test_rl_space_budgets_only_one_resumable_plus_four_exports(self):
+        from genevolve_repro.runtime import check_milestone_space
+
+        with TemporaryDirectory() as temp:
+            work = Path(temp)
+            policy = work / "policy"
+            fake_export(policy)
+            size = (policy / "model.safetensors").stat().st_size
+            threshold = 8 * 2**30 + (6 + 4) * size
+            with patch("shutil.disk_usage", return_value=SimpleNamespace(free=threshold)):
+                check_milestone_space(work, policy)
+            with patch("shutil.disk_usage", return_value=SimpleNamespace(free=threshold-1)):
+                with self.assertRaisesRegex(ValueError, "Remaining RL"):
+                    check_milestone_space(work, policy)
+
     def test_stage1_hardware_accepts_only_four_available_bf16_a100_80gb(self):
         from genevolve_repro.runtime import preflight
 

@@ -35,9 +35,28 @@ class NativeSftTest(TestCase):
         self.assertFalse(cfg['packing'] or cfg['mask_history'] or cfg['train_on_prompt'] or cfg['save_only_model'])
         self.assertTrue(cfg['freeze_vision_tower'] and cfg['freeze_multi_modal_projector'])
         self.assertEqual(contract['sources']['sft_trainer']['revision'],'7af909522a951e3ad9f022ea6f88b6755257eaa5')
-        cfg2=native.launch_config(Path('test'),Path('test')/'native_sft/checkpoint-275')
+        upstream=native.read_json(native.ROOT/'configs/native_sft.json')
+        self.assertEqual(cfg,{**upstream,'save_strategy':'steps','save_steps':550})
+        self.assertEqual(cfg['eval_strategy'],'epoch')
+        cfg2=native.launch_config(Path('test'))
         for k,v in cfg.items():self.assertEqual(cfg2[k],v)
-        self.assertTrue(cfg2['resume_from_checkpoint'].endswith('checkpoint-275'))
+        self.assertNotIn('resume_from_checkpoint',cfg2)
+
+    def test_real_transformers_callbacks_eval_twice_save_only_at_550(self):
+        from transformers.trainer_callback import DefaultFlowCallback,TrainerControl,TrainerState
+        from types import SimpleNamespace
+        cfg=native.effective_recipe()
+        args=SimpleNamespace(**cfg,logging_strategy='steps',logging_first_step=False,eval_delay=0.)
+        state=TrainerState(max_steps=550,save_steps=cfg['save_steps'],logging_steps=5)
+        cb=DefaultFlowCallback();evaluated=[];saved=[]
+        for step in range(1,551):
+            state.global_step=step; state.epoch=step/275
+            c=cb.on_step_end(args,state,TrainerControl())
+            if step%275==0:cb.on_epoch_end(args,state,c)
+            if c.should_evaluate:evaluated.append(step)
+            if c.should_save:saved.append(step)
+        self.assertEqual(saved,[550])
+        self.assertEqual(evaluated,[275,550])
 
     def test_image_identity_and_assistant_alignment(self):
         with TemporaryDirectory() as temp:
@@ -62,11 +81,11 @@ class NativeSftTest(TestCase):
 
     def test_missing_zero_partition_invalidates_resume(self):
         with TemporaryDirectory() as temp:
-            cp=Path(temp)/'checkpoint-275';fixture_cp(cp,275)
-            self.assertEqual(native.native_checkpoint(cp,275),cp)
-            next((cp/'global_step275').glob('*rank_3*optim_states.pt')).unlink()
+            cp=Path(temp)/'checkpoint-550';fixture_cp(cp,550)
+            self.assertEqual(native.native_checkpoint(cp,550),cp)
+            next((cp/'global_step550').glob('*rank_3*optim_states.pt')).unlink()
             with self.assertRaisesRegex(ValueError,'partitions'):
-                native.native_checkpoint(cp,275)
+                native.native_checkpoint(cp,550)
 
     def test_never_adopt_arbitrary_or_unconfirmed_checkpoint(self):
         with TemporaryDirectory() as temp:
@@ -77,21 +96,29 @@ class NativeSftTest(TestCase):
             with self.assertRaisesRegex(ValueError,'Unconfirmed'):
                 native.run_native(work)
 
-    def test_sealed_work_resumes_at_275_without_attesting_failed_550(self):
+    def test_preserve_unexpected_intermediate_and_never_resume_it(self):
         with TemporaryDirectory() as temp:
             work=Path(temp); mid=work/'native_sft/checkpoint-275';fixture_cp(mid,275)
             write_json(work/'native_sft_run/contract.json',native.native_contract())
+            with self.assertRaisesRegex(ValueError,'Unexpected intermediate'):
+                native.run_native(work)
+            self.assertTrue(mid.is_dir())
+
+    def test_interruption_has_no_midpoint_resume(self):
+        with TemporaryDirectory() as temp:
+            work=Path(temp)
             def interrupted(command,**kwargs):
                 cfg=json.loads(Path(command[-1]).read_text(encoding='utf-8'))
-                self.assertEqual(Path(cfg['resume_from_checkpoint']),mid)
+                self.assertNotIn('resume_from_checkpoint',cfg)
                 raise InterruptedError('interrupted test trainer')
             with (patch.object(native,'verify_runtime'),patch.object(native,'prepare_native',return_value=(work/'base',work/'data')),
                   patch.object(native.shutil,'disk_usage',return_value=type('Disk',(),{'free':200*2**30})()),
                   patch('genevolve_repro.native_sft_probe.verify_labels',return_value={}),
                   patch.object(native.subprocess,'run',side_effect=interrupted)):
-                with self.assertRaises(InterruptedError):
-                    native.run_native(work)
+                for _ in range(2):
+                    with self.assertRaises(InterruptedError):native.run_native(work)
             self.assertFalse((work/'native_sft_run/trainer-succeeded.json').exists())
+            self.assertFalse((work/'native_sft/checkpoint-275').exists())
 
     def test_stage_handoff_only_after_four_rank_launcher_success(self):
         with TemporaryDirectory() as temp:
@@ -101,7 +128,7 @@ class NativeSftTest(TestCase):
                 self.assertIn('llamafactory.launcher',command)
                 launched=json.loads(Path(command[-1]).read_text(encoding='utf-8'))
                 self.assertEqual(Path(launched['output_dir']),out)
-                for step in (275,550):fixture_cp(out/f'checkpoint-{step}',step)
+                fixture_cp(out/'checkpoint-550',550)
                 for f in (out/'checkpoint-550').iterdir():
                     if f.is_file(): (out/f.name).write_bytes(f.read_bytes())
             with (patch.object(native,'verify_runtime'),patch.object(native,'prepare_native',return_value=(work/'base',work/'data')),

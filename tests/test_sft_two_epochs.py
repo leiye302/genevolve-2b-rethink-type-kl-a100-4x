@@ -12,7 +12,7 @@ from genevolve_repro import route_sft as mod
 
 
 class TwoEpochTest(unittest.TestCase):
-    def test_midpoint_resume_keeps_global_curve_batch_order_and_exports_only_at_end(self):
+    def test_two_epochs_no_midpoint_save_then_recover_final_export_without_retraining(self):
         cfg=mod.recipe()
         batches=[[i] for i in range(281)]
         trace=[]; exports=[]; saves=[]; cached=[]; interrupt=[True]
@@ -54,11 +54,12 @@ class TwoEpochTest(unittest.TestCase):
             root=Path(directory)
             with self.assertRaises(InterruptedError):
                 mod.worker(root,root/'parent',root/'data')
-            self.assertEqual(saves,[281]);self.assertEqual(exports,[])
+            self.assertEqual(saves,[562]);self.assertEqual(exports,[])
+            self.assertFalse((root/'route_sft'/'checkpoint-00281').exists())
             self.assertFalse((root/'route_sft'/'hf-step-00281').exists())
             mod.worker(root,root/'parent',root/'data')
-            self.assertEqual(saves,[281,562]);self.assertEqual(exports,[562])
-            self.assertEqual(len(cached),2)
+            self.assertEqual(saves,[562]);self.assertEqual(exports,[562])
+            self.assertEqual(len(cached),1)
             self.assertEqual([i for i,lr in trace],list(range(281))*2)
             self.assertEqual(len(trace),562)
             self.assertGreater(trace[281][1],0);self.assertLess(trace[281][1],trace[280][1])
@@ -67,6 +68,39 @@ class TwoEpochTest(unittest.TestCase):
                 m=mod.read_json(root/'route_sft/metrics'/f'step-{step:05d}.json')
                 self.assertEqual((m['epoch'],m['batch_in_epoch']),((step-1)//281+1,(step-1)%281+1))
             self.assertTrue((root/'route_sft/hf-step-00562/export_sha256.json').is_file())
+            for n,file,match in [('old-midpoint','checkpoint-00281','legacy midpoint'),
+                                 ('old-281-export','hf-step-00281','legacy midpoint'),
+                                 ('interrupted','metrics/step-00281.json','without the final'),
+                                 ('orphan-export','hf-step-00562','without the final')]:
+                old=root/n/'route_sft'/file
+                if file.endswith('.json'):
+                    mod.write_json(old,{'unchanged':True})
+                else:
+                    old.mkdir(parents=True)
+                with self.subTest(case=n),self.assertRaisesRegex(ValueError,match):
+                    mod.worker(root/n,root/'parent',root/'data')
+                self.assertTrue(old.exists())
+                self.assertFalse((root/n/'route_sft'/'hardware.json').exists())
+                self.assertFalse((root/n/'route_sft'/'contract.json').exists())
+            self.assertEqual(len(trace),562)
+
+    def test_read_only_old_complete_export_compatible_only_with_persistence_change(self):
+        cfg=mod.recipe()
+        old={'config':cfg,'save_resumable_at':[281,562],'route_data_source_sha256':mod.source_checkpoint_lock(),
+             'parent':{'id':'original'},'manifest_sha256':'fixture','artifact_sha256':{}}
+        wanted={**old,'save_resumable_at':[562]}
+        with TemporaryDirectory() as tmp,patch.multiple(mod,verify_parent_identity=lambda *_:None,
+                verify_artifact_identity=lambda *_:None,sft_manifest=lambda _:{'fixture':'weights'}):
+            folder=Path(tmp)
+            mod.write_json(folder/'completed.json',{'step':562,'algorithm':'route-sft','contract':old})
+            mod.write_json(folder/'export_sha256.json',{'fixture':'weights'})
+            returned=mod.verify_route_export(folder,expected_contract=wanted)
+            self.assertEqual(returned['completed']['contract']['save_resumable_at'],[281,562])
+            with self.assertRaisesRegex(ValueError,'does not match'):
+                mod.verify_route_export(folder,expected_contract={**wanted,'parent':{'id':'different'}})
+            mod.write_json(folder/'completed.json',{'step':281,'algorithm':'route-sft','contract':old})
+            with self.assertRaisesRegex(ValueError,'complete configured'):
+                mod.verify_route_export(folder,expected_contract=wanted)
 
 
 if __name__=='__main__':unittest.main()

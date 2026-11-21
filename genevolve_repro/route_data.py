@@ -224,5 +224,5 @@ def route_identity(folder, m, cfg, parent_identity):
         "route_data_source_sha256": m["checkpoint550_file_sha256"],
         "actor_text_protocol": ACTOR_TEXT_PROTOCOL,
         "objective": "original+good_3way_forward_KL",
-        "schedule_steps": 562, "save_resumable_at": [281, 562], "export_hf_at": [562],
+        "schedule_steps": 562, "save_resumable_at": [562], "export_hf_at": [562],
     }

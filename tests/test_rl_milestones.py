@@ -23,48 +23,77 @@ class MilestoneTest(unittest.TestCase):
         reports = set()
         order = []
 
-        def train(step):
-            done.add(step)
-            order.append(("train", step))
+        def train():
+            order.append(("launch", 40))
+            for step in plan.STOPS:
+                done.add(step)
+                if step < 40:
+                    score(plan.policy_path(work, step), 8)
 
         def score(policy, maximum):
             reports.add((policy, maximum))
             order.append((policy.name, maximum))
 
-        with patch.object(plan, "verified_policy", side_effect=lambda w, s, step: step in done), \
+        with patch.object(plan, "require_restartable"), \
+                patch.object(plan, "verified_policy", side_effect=lambda w, s, step: step in done), \
                 patch.object(evaluate, "bench_complete", side_effect=lambda w, p, m: (p, m) in reports):
             plan.run_schedule(work, {}, train, score)
             first = list(order)
             plan.run_schedule(work, {}, train, score)
         self.assertEqual(order, first)
-        self.assertEqual(first, [("train", 10), ("hf-step-00010", 8), ("train", 20), ("hf-step-00020", 8),
-                                 ("train", 30), ("hf-step-00030", 8), ("train", 40), ("final", 8), ("final", None)])
+        self.assertEqual(first, [("launch",40), ("hf-step-00010",8), ("hf-step-00020",8),
+                                 ("hf-step-00030",8), ("final",8), ("final",None)])
         self.assertNotEqual(evaluate.eval_folder(work, work / "rethink/final", "bench", 8),
                             evaluate.eval_folder(work, work / "rethink/final", "bench", None))
-        for parameters in [(10, 10, True), (40, 15, True), (40, 10, False)]:
-            with self.assertRaises(ValueError):
-                plan.stop_step(*parameters)
+
+    def test_partial_weights_cannot_be_used_for_mid_rl_resume(self):
+        with TemporaryDirectory() as d:
+            work=Path(d)
+            plan.require_restartable(work)
+            write_json(plan.policy_path(work,10)/"completed.json",{"step":10})
+            with self.assertRaisesRegex(ValueError,"fresh WORK"):
+                plan.run_schedule(work, {}, self.fail, self.fail)
+
+    def test_live_fixed8_child_isolated_from_worker_and_waits_on_cpu(self):
+        work,policy=Path("work"),Path("work/rethink/hf-step-00020")
+        group = object()
+        with patch.dict(os.environ, {"RANK":"0","WORLD_SIZE":"4","MASTER_PORT":"12",
+                                     "CUDA_VISIBLE_DEVICES":"3,5,7,2","IMAGE_DOWNLOAD_DIR":"training-cache"}), \
+                patch.object(plan.torch.cuda,"empty_cache"), \
+                patch.object(plan.torch.cuda,"mem_get_info",return_value=(60*2**30,80*2**30)), \
+                patch.object(evaluate,"bench_complete",side_effect=[False,True]), \
+                patch.object(plan.subprocess,"run") as launch, \
+                patch.object(plan.dist,"broadcast_object_list") as wait:
+            plan.live_fixed8(work,policy,0,group)
+            args=launch.call_args
+            self.assertEqual(args.args[0][1:],["-m","genevolve_repro.evaluate","--work",str(work),"--policy",str(policy)])
+            env=args.kwargs["env"]
+            self.assertEqual(env["CUDA_VISIBLE_DEVICES"],"3")
+            self.assertFalse({"MASTER_PORT","WORLD_SIZE","RANK"} & set(env))
+            self.assertEqual(env["IMAGE_DOWNLOAD_DIR"],str(work/"cache/eval-rank0"))
+            self.assertEqual(os.environ["IMAGE_DOWNLOAD_DIR"],"training-cache")
+            wait.assert_called_once_with([""],src=0,group=group)
 
     def test_corrupt_checkpoint_invalidates_handoff_even_if_export_metadata_intact(self):
         with TemporaryDirectory() as d:
             work = Path(d)
-            policy = plan.policy_path(work, 10)
-            cp = work / "rethink/checkpoint-00010"
+            policy = plan.policy_path(work, 40)
+            cp = work / "rethink/checkpoint-00040"
             cp.mkdir(parents=True)
             ct = {"algorithm": plan.ALGORITHM, "total_steps": 40, "world_size": 4,
-                  "sft": {"origin": "fixture"}, "milestones": list(plan.STOPS)}
+                  "sft": {"origin": "fixture"}, "milestones": list(plan.STOPS), "storage": plan.STORAGE}
             write_json(work / "rethink/contract.json", ct)
             model = cp / "training.pt"
             model.write_bytes(b"valid")
             sha = file_sha256(model)
             write_json(cp / "state_sha256.json", {"training.pt": sha})
-            write_json(policy / "completed.json", {"step": 10, **plan.export_meta(ct, sha)})
+            write_json(policy / "completed.json", {"step": 40, **plan.export_meta(ct, sha)})
             write_json(policy / "export_sha256.json", {"fixture": True})
             with patch.object(plan, "sft_manifest", return_value={"fixture": True}):
-                self.assertTrue(plan.verified_policy(work, ct["sft"], 10))
+                self.assertTrue(plan.verified_policy(work, ct["sft"], 40))
                 model.write_bytes(b"wrong")
                 with self.assertRaises(ValueError):
-                    plan.verified_policy(work, ct["sft"], 10)
+                    plan.verified_policy(work, ct["sft"], 40)
 
     def test_594_cases_accept_official_missing_image_not_transport_errors(self):
         expected = list(map(str, range(594)))
@@ -188,18 +217,34 @@ class MilestoneTest(unittest.TestCase):
             stack.enter_context(patch("transformers.AutoTokenizer.from_pretrained",
                                      return_value=SimpleNamespace(eos_token_id=0)))
             stack.enter_context(patch("genevolve_repro.distributed.gather", side_effect=lambda x: [x] * 4))
-            for work, stops in ((base, [None]), (resumed, [10,20,30,40])):
-                for stop in stops:
-                    evolve._loop(work, root / "sft", 0, 4, device, 40, rethink=True, stop_after=stop)
-                    if stop == 10:
-                        # Simulate loss of the not-yet-finished HF handoff AFTER native save.
-                        export_marker = plan.policy_path(work, stop) / "completed.json"
-                        export_marker.unlink()
-                        export_marker.parent.rmdir()
-                        evolve._loop(work, root / "sft", 0, 4, device, 40, rethink=True, stop_after=stop)
-                        self.assertEqual(read_json(export_marker)["step"], 10)
+            stack.enter_context(patch.object(evolve,"control_group",return_value=object()))
+            seen = []
+            def probe(work,policy,rank,group):
+                n=read_json(policy/"completed.json")["step"]
+                self.assertEqual(read_json(policy/"completed.json")["artifact"],"weights_only")
+                self.assertEqual(list((work/"rethink").glob("checkpoint-*")),[])
+                self.assertFalse(list((work/"rethink").rglob("training.pt")))
+                self.assertTrue((work/"rethink/metrics"/f"step-{n:05d}.json").is_file())
+                self.assertFalse((work/"rethink/metrics"/f"step-{n+1:05d}.json").exists())
+                # Even deliberate consumption IN the trainer is isolated by its
+                # in-memory save/restore, in addition to actual subprocess isolation.
+                random.seed(987+n); torch.manual_seed(654+n); torch.rand(1)
+                seen.append(n)
+            stack.enter_context(patch.object(evolve,"live_fixed8",probe))
+            evolve._loop(base, root/"sft", 0, 4, device, 40, rethink=True)
+            with patch.object(evolve,"save_checkpoint",wraps=evolve.save_checkpoint) as save:
+                evolve._loop(resumed,root/"sft",0,4,device,40,rethink=True,milestone_eval=True)
+                self.assertEqual([c.args[4] for c in save.call_args_list],[40])
+            self.assertEqual(seen,[10,20,30])
+            # Crash AFTER the sole native save but BEFORE finishing the final HF export.
+            marker = plan.policy_path(resumed,40) / "completed.json"
+            marker.unlink()
+            marker.parent.rmdir()
+            evolve._loop(resumed,root/"sft",0,4,device,40,rethink=True,milestone_eval=True)
+            self.assertEqual(read_json(marker)["step"],40)
+            self.assertEqual(seen,[10,20,30])
             left, right = [load_checkpoint(w / "rethink/checkpoint-00040") for w in (base, resumed)]
-            self.assertEqual(len(list((resumed / "rethink").glob("checkpoint-*"))), 4)
+            self.assertEqual([p.name for p in (resumed/"rethink").glob("checkpoint-*")], ["checkpoint-00040"])
             self.assertEqual(left["scheduler"], right["scheduler"])
             self.assertEqual(right["scheduler"]["T_max"], 40)
             self.assertEqual(left["memory"], right["memory"])

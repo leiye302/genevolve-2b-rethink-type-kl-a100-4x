@@ -55,6 +55,31 @@ class NativeParentHandoff(unittest.TestCase):
         self.assertEqual(verify_parent(other),fresh)
         self.assertEqual(verify_parent_identity(fresh),fresh)
 
+    def test_first_release_sealed_550_readable_but_no_legacy_resealing(self):
+        from genevolve_repro.native_handoff import _identity,_resume_manifest,is_legacy_contract,RECEIPT
+        from genevolve_repro.native_sft import run_native
+        old=self.contract.copy()
+        old['format']='genevolve-original-multimodal-2b-sft550-v1'
+        old.pop('checkpoint_policy')
+        old['lhf_recipe']=read_json(ROOT/'configs/native_sft.json')
+        old['launcher_sources_sha256']={
+            'native_sft.py':'384f61131501c5f80a4c6a85696b32da42e99c76527a4193383087538446c860',
+            'native_sft_data.py':'895cfd46e38faf7862941cc426f6a83d7c6788fb81dff3dba43c4a8b29898dcf',
+            'native_sft_probe.py':'84106e3e6f5cf98a96b53f5c43e7272ccf43be7776f015ae5df57ec544b2bb14'}
+        self.assertTrue(is_legacy_contract(old))
+        with self.assertRaisesRegex(ValueError,'unpinned'):
+            seal_native_parent(self.ck,old)
+        self.assertFalse((self.ck/RECEIPT).exists())
+        stored=_identity(sft_manifest(self.ck),old,_resume_manifest(self.ck))
+        write_json(self.ck/RECEIPT,stored)
+        self.assertEqual(verify_parent(self.ck),stored)
+        work=self.ck.parents[1]
+        write_json(work/'native_sft_run/contract.json',old)
+        write_json(work/'native_sft_run/trainer-succeeded.json',{'contract':old,'completed':550})
+        self.assertEqual(run_native(work),self.ck)
+        (self.ck/'global_step550/mp_rank_00_model_states.pt').write_bytes(b'altered')
+        with self.assertRaises(ValueError):run_native(work)
+
     def test_changed_hf_optimizer_rng_and_training_state_rejected(self):
         seal_native_parent(self.ck,self.contract)
         for name in ("model.safetensors","training_args.bin",f"{TAG}/bf16_zero_pp_rank_2_mp_rank_00_optim_states.pt",

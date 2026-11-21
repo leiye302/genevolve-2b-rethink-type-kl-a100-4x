@@ -136,12 +136,12 @@ def run_rethink_40(work, route_export, route_id):
 
     if not embedding_ready(work):
         prepare_embedding(work)
-    def train_to(stop):
+    def train_once():
         check_milestone_space(work, route_export)
         preflight("rethink", work)
         distributed("_rethink", work, "--sft-checkpoint", str(route_export), "--steps", "40",
-                    "--stop-after", str(stop))
-    run_schedule(work, route_id, train_to, lambda policy, count: dispatch_bench(work, policy, count))
+                    "--milestone-eval")
+    run_schedule(work, route_id, train_once, lambda policy, count: dispatch_bench(work, policy, count))
 
 
 def execute(args, work):
@@ -249,7 +249,7 @@ def main():
     commands.add_parser("prepare-route", help="download and check the public Route-SFT pack (CPU only)")
     commands.add_parser("prepare-embedding", help="download GenEvolve's pinned experience-retrieval model")
     commands.add_parser("prepare-native", help="prepare the original SFT data and bare 2B base")
-    commands.add_parser("native-sft", help="train or resume just the native SFT-550").add_argument(
+    commands.add_parser("native-sft", help="train or reuse the completed native SFT-550").add_argument(
         "--eval", action="store_true", help="also evaluate its final checkpoint on fixed 8")
     sft_flag(commands.add_parser("check-sft", help="check and fingerprint an existing SFT export"))
     pipeline = commands.add_parser("all", help="all three stages, six fixed-8 evaluations and a final full benchmark")
@@ -270,7 +270,7 @@ def main():
         else:
             stage.add_argument("--steps", type=int, help="baseline only: RL updates (default: one pass over the train split)")
         if name == "_rethink":
-            stage.add_argument("--stop-after", type=int, required=True, choices=(10,20,30,40))
+            stage.add_argument("--milestone-eval", action="store_true", required=True)
     for name in ("eval", "_eval"):
         eval_flags(commands.add_parser(name))
     args = parser.parse_args()
@@ -306,7 +306,7 @@ def main():
     elif args.command in {"_grpo", "_rethink"}:
         from genevolve_repro.evolve import worker
         worker(work, args.sft_checkpoint.resolve(), args.steps, rethink=args.command == "_rethink",
-               stop_after=getattr(args, "stop_after", None))
+               milestone_eval=getattr(args, "milestone_eval", False))
     elif args.command == "_eval":
         from genevolve_repro.evaluate import worker
         policy = args.policy.resolve() if args.policy else final_route_export(work)
