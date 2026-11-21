@@ -54,5 +54,25 @@ class SingleGpuObjectiveTest(unittest.TestCase):
             actor(torch.tensor([[3,2]]),2,1,branch='kl',reference=[-1.]*3)
         self.assertEqual(TYPE_IDS,(151657,27,9217))
 
+    def test_cpu_smoke_checks_kl_gradient_without_updating_the_model(self):
+        from scripts.check_route_cpu import probe_good_kl
+        model=ToyPolicy()
+        actor=RouteScorer(model,type_ids=(2,3,4))
+        ids=torch.tensor([[4,8]])
+        weight=model.lm_head.weight
+        before=weight.detach().clone()
+        # Valid teacher and student may already agree: exact zero is not a broken graph.
+        from genevolve_repro.route_type_kl import score_threeway
+        ref=score_threeway(model,ids,2,(2,3,4)).detach()
+        self.assertEqual(actor(ids,2,0,branch='kl',reference=ref).item(),0.)
+        probe=probe_good_kl(actor,ids,2,weight)
+        self.assertTrue(probe['synthetic_probe_only'])
+        self.assertGreater(probe['head_max_abs_grad'],0)
+        self.assertIsNone(weight.grad)
+        torch.testing.assert_close(weight.detach(),before,rtol=0,atol=0)
+        # A finite positive scalar alone is not sufficient to pass the probe.
+        with self.assertRaisesRegex(ValueError,'nondegenerate probe failed'):
+            probe_good_kl(lambda *a,**kw: 1 + 0*weight.sum(),ids,2,weight)
+
 
 if __name__=='__main__':unittest.main()

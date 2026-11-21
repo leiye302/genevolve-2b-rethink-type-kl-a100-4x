@@ -16,6 +16,18 @@ from genevolve_repro.route_type_kl import score_threeway, verify_type_ids
 from genevolve_repro.sft_export import file_sha256
 
 
+def probe_good_kl(scorer, prefix, start, weight):
+    """Separate diagnostic, not a parent cache entry and never used by the optimizer."""
+    import torch
+    ref = torch.tensor([.45, .45, .10], dtype=torch.float32, device=prefix.device).log()
+    value = scorer(prefix, start, 0, branch="kl", reference=ref)
+    grad, = torch.autograd.grad(value, weight)
+    max_grad = grad.detach().abs().max().item()
+    if not torch.isfinite(value) or not value.item() > 0 or not torch.isfinite(grad).all() or not max_grad > 0:
+        raise ValueError(f'Good-KL nondegenerate probe failed: loss={value.item()}, max_abs_grad={max_grad}.')
+    return {'synthetic_probe_only': True, 'kl': value.detach().item(), 'head_max_abs_grad': max_grad}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, required=True)
@@ -94,15 +106,26 @@ def main():
             raise ValueError('Non-finite smoke gradient.')
         optimizer.step()
     delta = (weight.detach() - initial).abs().max().item()
-    if not delta > 0 or not any(v['kl'] > 0 for v in values if not v['label']):
-        raise ValueError('Optimizer or Good-KL smoke did not exercise the intended graph.')
+    good_kl = torch.tensor([v['kl'] for v in values if not v['label']])
+    # The random tiny actor starts identical to its frozen reference. Most of its
+    # mass is Other, so changes after one historical-LR update can be below FP32
+    # resolution, including tiny *negative* measured KLs. Preserve raw values.
+    if not delta > 0 or not torch.isfinite(weight.detach()).all():
+        raise ValueError(f'Optimizer did not make a finite parameter update: max_abs_delta={delta}.')
+    if (len(good_kl) != cfg['good_per_batch'] or not torch.isfinite(good_kl).all()
+            or torch.any(good_kl < -8 * torch.finfo(torch.float32).eps)):
+        raise ValueError(f'Invalid Good frozen-parent smoke KLs: {good_kl.tolist()}.')
     if any(v['kl'] != 0 for v in values if v['label']):
         raise ValueError('Bad unexpectedly contributed type KL.')
+    k = next(k for k in batch if rows[k]['route_label'] == 0)
+    start = rows[k]['target_start']
+    probe = probe_good_kl(scorer, torch.tensor([rows[k]['input_ids'][:start]]), start, weight)
     report = {'rows': len(rows), 'batches': len(batches), 'public_tokenizer_source': source,
               'artifact_sha256': {f: file_sha256(folder / f) for f in ('train.jsonl', 'batches.jsonl')},
               'smoke_batch': batches.index(batch), 'all_four_categories': True, 'updates': 2,
               'tiny_random_model_only': True, 'actual_sft550_or_gpu_verified': False,
-              'gradient_norm': float(norm), 'weight_max_delta': delta, 'last_batch': values}
+              'gradient_norm': float(norm), 'weight_max_delta': delta, 'last_batch': values,
+              'good_kl_autograd_probe': probe}
     write_json(work / 'cpu_smoke_receipt.json', report)
     print({'smoke': 'passed', 'actual_sft550_or_gpu_verified': False}, flush=True)
 
